@@ -58,7 +58,7 @@ export function activate(ctx) {
     return projects;
   };
 
-  /** The open thread's project, as the host reports it. Every person-facing entry needs one. */
+  /** The open thread, as the host reports it. Views and statuses always have one. */
   const contextThread = async (invocation) => {
     const threadId = invocation.context?.threadId;
     if (!threadId) throw new Error("Open a thread in the project first.");
@@ -80,7 +80,8 @@ export function activate(ctx) {
       const thread = await ctx.threads.metadata({ threadId: stored.threadId });
       return thread.projectId === projectId && !thread.archivedAt ? thread : null;
     } catch (error) {
-      // The caller just read a thread in this project, so a denial here means it was deleted.
+      // Threads in a granted project are readable, so a denial means the coordinator was deleted.
+      // Without the grant, starting a replacement is denied as well.
       if (error?.reason === "permission_denied") return null;
       throw error;
     }
@@ -94,7 +95,7 @@ export function activate(ctx) {
     }
   };
 
-  const startCoordinator = (projectId, goal, invocation) =>
+  const openCoordinator = (projectId, invocation) =>
     serial(async () => {
       const existing = await liveCoordinator(projectId);
       if (existing) return existing.id;
@@ -102,7 +103,7 @@ export function activate(ctx) {
       const { threadId } = await ctx.threads.create({
         projectId,
         title: projects.get(projectId)?.title ?? "Coordinator",
-        text: brief(goal),
+        text: brief(),
         // A plan-mode source thread would otherwise make the coordinator and its workers plan-only.
         interactionMode: "default",
         idempotencyKey: "start-coordinator",
@@ -130,11 +131,18 @@ export function activate(ctx) {
     });
 
   ctx.handle("action:coordinator", async (_input, invocation) => {
-    const thread = await contextThread(invocation);
-    const coordinator = await liveCoordinator(thread.projectId);
-    if (coordinator && coordinator.id !== thread.id)
-      return { intents: [{ type: "thread.reveal", threadId: coordinator.id }] };
-    return { intents: [{ type: "view.open", viewId: "coordinator" }] };
+    const { threadId, projectId: selected } = invocation.context ?? {};
+    // From the palette a person may have a project selected without any thread open in it.
+    const projectId = threadId ? (await contextThread(invocation)).projectId : selected;
+    if (!projectId) return { message: "Select a project first." };
+    const coordinatorId = await openCoordinator(projectId, invocation);
+    return {
+      intents: [
+        coordinatorId === threadId
+          ? { type: "view.open", viewId: "coordinator" }
+          : { type: "thread.reveal", threadId: coordinatorId },
+      ],
+    };
   });
 
   ctx.handle("action:memory-read", async (_input, invocation) => {
@@ -173,13 +181,6 @@ export function activate(ctx) {
         notes,
       },
     };
-  });
-
-  ctx.handle("view:coordinator:start", async (input, invocation) => {
-    const thread = await contextThread(invocation);
-    const goal = typeof input?.goal === "string" ? input.goal.trim().slice(0, 8000) : "";
-    const threadId = await startCoordinator(thread.projectId, goal, invocation);
-    return { intents: [{ type: "thread.reveal", threadId }] };
   });
 
   ctx.handle("view:coordinator:remember", async (input, invocation) => {

@@ -101,47 +101,54 @@ const agent = (threadId, operationId = `op-${++operation}`) => ({
   caller: { kind: "agent", threadId },
 });
 
-NodeTest.test("starting twice keeps one coordinator, in default mode, with the goal", async () => {
+const start = (h, threadId) => h.invoke("action:coordinator", {}, client(threadId));
+
+NodeTest.test("opening twice keeps one coordinator, started in default mode", async () => {
   const h = host({ threads: [thread("here", { interactionMode: "plan" })] });
-  const goal = { goal: "Ship dark mode" };
-  const first = await h.invoke("view:coordinator:start", goal, client("here"));
-  const again = await h.invoke("view:coordinator:start", {}, client("here"));
+  const first = await start(h, "here");
+  const again = await start(h, "here");
   NodeAssert.equal(h.state.created.length, 1);
   NodeAssert.deepEqual(first.intents, [{ type: "thread.reveal", threadId: "coordinator-1" }]);
   NodeAssert.deepEqual(again.intents, first.intents);
   const [request] = h.state.created;
   NodeAssert.equal(request.title, "Demo");
   NodeAssert.equal(request.interactionMode, "default");
-  NodeAssert.match(request.text, /Ship dark mode/);
+  NodeAssert.match(request.text, /delegate_task/);
   NodeAssert.ok(h.state.invalidated.includes("tree:coordinator"));
 });
 
 NodeTest.test(
-  "the action reveals a live coordinator and offers a new one once it is gone",
+  "a project with no threads yet can start one, and the coordinator opens its panel",
   async () => {
-    const h = host({ threads: [thread("here")] });
-    NodeAssert.deepEqual((await h.invoke("action:coordinator", {}, client("here"))).intents, [
+    const h = host();
+    const opened = await h.invoke("action:coordinator", {}, {
+      ...client(),
+      context: { projectId: "p" },
+    });
+    NodeAssert.deepEqual(opened.intents, [{ type: "thread.reveal", threadId: "coordinator-1" }]);
+    NodeAssert.deepEqual((await start(h, "coordinator-1")).intents, [
       { type: "view.open", viewId: "coordinator" },
     ]);
-    await h.invoke("view:coordinator:start", {}, client("here"));
-    NodeAssert.deepEqual((await h.invoke("action:coordinator", {}, client("here"))).intents, [
-      { type: "thread.reveal", threadId: "coordinator-1" },
-    ]);
-    h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
-    const read = await h.invoke("view:coordinator:read", {}, client("here"));
-    NodeAssert.equal(read.data.coordinator, null);
-    h.state.threads.get("coordinator-1").deleted = true;
-    await h.invoke("view:coordinator:start", {}, client("here"));
-    NodeAssert.equal(h.state.created.length, 2);
   },
 );
 
-NodeTest.test("a person-facing call without an open thread explains itself", async () => {
+NodeTest.test("an archived or deleted coordinator is replaced on the next open", async () => {
+  const h = host({ threads: [thread("here")] });
+  await start(h, "here");
+  h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
+  const read = await h.invoke("view:coordinator:read", {}, client("here"));
+  NodeAssert.equal(read.data.coordinator, null);
+  await start(h, "here");
+  h.state.threads.get("coordinator-2").deleted = true;
+  await start(h, "here");
+  NodeAssert.equal(h.state.created.length, 3);
+});
+
+NodeTest.test("opening without a project explains itself", async () => {
   const h = host();
-  await NodeAssert.rejects(
-    h.invoke("action:coordinator", {}, { ...client(), context: {} }),
-    /Open a thread in the project first/,
-  );
+  const result = await h.invoke("action:coordinator", {}, { ...client(), context: {} });
+  NodeAssert.equal(result.message, "Select a project first.");
+  NodeAssert.equal(h.state.created.length, 0);
 });
 
 NodeTest.test(
@@ -189,7 +196,7 @@ NodeTest.test("a person can add and remove notes from the panel", async () => {
 
 NodeTest.test("the status chip describes the coordinator and its workers only", async () => {
   const h = host({ threads: [thread("here"), thread("bystander")] });
-  await h.invoke("view:coordinator:start", {}, client("here"));
+  await start(h, "here");
   h.state.threads.set("busy", delegated("busy", "coordinator-1", { isRunning: true }));
   h.state.threads.set("blocked", delegated("blocked", "coordinator-1", { needsAttention: true }));
   h.state.threads.set(
@@ -217,8 +224,8 @@ NodeTest.test(
       threads: [thread("here"), thread("there", { projectId: "q" })],
     });
     NodeAssert.deepEqual(await h.tree(), { nodes: [] });
-    await h.invoke("view:coordinator:start", {}, client("here"));
-    await h.invoke("view:coordinator:start", {}, client("there"));
+    await start(h, "here");
+    await start(h, "there");
     // A deleted coordinator and an ungranted project must not reach the snapshot.
     h.state.threads.get("coordinator-2").deleted = true;
     for (let i = 0; i < 10_000; i++) h.state.threads.set(`t${i}`, thread(`t${i}`));

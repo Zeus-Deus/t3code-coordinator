@@ -96,8 +96,7 @@
         font-weight: 500;
       }
       button,
-      input,
-      textarea {
+      input {
         font: inherit;
         font-size: 12px;
         color: var(--fg);
@@ -115,12 +114,6 @@
         opacity: 0.5;
         cursor: default;
       }
-      button.primary {
-        align-self: flex-start;
-        background: var(--fg);
-        border-color: var(--fg);
-        color: var(--bg);
-      }
       button.ghost {
         min-height: 22px;
         padding: 0 6px;
@@ -129,22 +122,16 @@
         color: var(--muted);
       }
       button:focus-visible,
-      input:focus-visible,
-      textarea:focus-visible {
+      input:focus-visible {
         outline: 2px solid var(--ring);
         outline-offset: 1px;
       }
-      textarea,
       input {
         width: 100%;
         padding: 6px 8px;
         border: 1px solid var(--input);
         border-radius: calc(var(--radius) - 2px);
         background: var(--bg);
-      }
-      textarea {
-        min-height: 72px;
-        resize: vertical;
       }
       ul {
         display: flex;
@@ -193,17 +180,10 @@
           Choose <strong>Coordinator</strong> in the sidebar's view menu to see its workers:
           needs you, working, ready for review and done.
         </p>
-        <section id="start" hidden>
-          <p class="hint">
-            Start one long-running thread for this project. You talk to it; it plans the work,
-            hands it to parallel workers, and reviews what comes back.
-          </p>
-          <textarea
-            id="goal"
-            placeholder="What should this project accomplish? (optional)"
-          ></textarea>
-          <button type="button" class="primary" id="start-button">Start coordinator</button>
-        </section>
+        <p class="hint" id="none" hidden>
+          This project has no coordinator. Run <strong>Open project coordinator</strong> from the
+          command palette to start one.
+        </p>
       </section>
 
       <section aria-labelledby="memory-heading">
@@ -280,7 +260,7 @@
           coordinator = data.coordinator;
           $("current").hidden = !coordinator;
           $("current-hint").hidden = !coordinator;
-          $("start").hidden = !!coordinator;
+          $("none").hidden = !!coordinator;
           if (coordinator) {
             $("current-title").textContent = coordinator.title;
             $("open").hidden = data.isCoordinator;
@@ -296,22 +276,6 @@
 
         $("open").addEventListener("click", function () {
           if (coordinator) reveal(coordinator.threadId);
-        });
-
-        $("start-button").addEventListener("click", function () {
-          var button = $("start-button");
-          button.disabled = true;
-          button.textContent = "Starting…";
-          // The result's thread.reveal intent opens the new coordinator.
-          call("view:coordinator:start", { goal: $("goal").value })
-            .then(function () {
-              $("goal").value = "";
-              return refresh();
-            }, function () {})
-            .then(function () {
-              button.disabled = false;
-              button.textContent = "Start coordinator";
-            });
         });
 
         $("remember").addEventListener("submit", function (event) {

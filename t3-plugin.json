@@ -17,8 +17,8 @@
   "actions": [
     {
       "id": "coordinator",
-      "title": "Project coordinator",
-      "description": "Open this project's coordinator, or start one.",
+      "title": "Open project coordinator",
+      "description": "Open this project's coordinator thread, starting one if it has none.",
       "placements": ["palette", "thread-menu"]
     },
     {

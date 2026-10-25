@@ -144,10 +144,9 @@ NodeTest.test("stored data from an unknown version is refused, not overwritten",
   NodeAssert.throws(() => decodeCoordinators({ version: 2, projects: {} }), /unknown format/);
 });
 
-NodeTest.test("the brief carries the goal and points at T3's own orchestration tools", () => {
-  const text = brief("Ship dark mode");
-  NodeAssert.match(text, /Ship dark mode/);
+NodeTest.test("the brief points at T3's own orchestration tools and asks for the goal", () => {
+  const text = brief();
   for (const tool of ["delegate_task", "t3_plugin_invoke", "memory-read", "t3_thread_organize"])
     NodeAssert.ok(text.includes(tool), tool);
-  NodeAssert.match(brief(""), /ask what this project should accomplish/);
+  NodeAssert.match(text, /ask what this project should accomplish/);
 });
