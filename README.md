@@ -20,8 +20,9 @@ The T3 server needs the plugin host with API v1 and native sidebar trees.
 
 ## Use it
 
-- Run **Project coordinator** from the command palette or a thread's menu. It opens the
-  project's coordinator, or a panel where you can start one, optionally with a goal.
+- Run **Open project coordinator** from the command palette or a thread's menu. It opens the
+  project's coordinator, starting one if there is none. The coordinator reads the project memory
+  and asks what you want to accomplish.
 - The coordinator delegates each piece with `delegate_task` in its own worktree. Results arrive in
   the coordinator's thread automatically, and it reviews them before accepting.
 - Choose **Coordinator** in the sidebar's view menu (the **View** menu on mobile) to see every
@@ -31,7 +32,7 @@ The T3 server needs the plugin host with API v1 and native sidebar trees.
   **Coordinator · 1 needs you · 2 working**. Select it for the panel.
 - The panel lists the project memory. You can add or remove notes there.
 
-To retire a coordinator, archive its thread. The next **Project coordinator** offers a new one.
+To retire a coordinator, archive its thread. The next **Open project coordinator** starts a new one.
 
 ### What the states mean
 

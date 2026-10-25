@@ -1,4 +1,5 @@
 import * as NodeAssert from "node:assert/strict";
+import * as NodeFs from "node:fs";
 import * as NodeTest from "node:test";
 import { activate } from "../plugin.mjs";
 
@@ -82,6 +83,7 @@ function host({ projects = [{ id: "p", title: "Demo" }], threads = [] } = {}) {
   });
   return {
     state,
+    handlers,
     invoke: (name, input, invocation) => handlers.get(name)(input, invocation),
     tree: () => tree({ signal: new AbortController().signal }),
   };
@@ -194,6 +196,29 @@ NodeTest.test("a person can add and remove notes from the panel", async () => {
   NodeAssert.deepEqual(removed.data.notes, []);
 });
 
+NodeTest.test("removing a note refreshes other open panels", async () => {
+  const h = host({ threads: [thread("here")] });
+  const note = { text: "No new deps." };
+  const added = await h.invoke("view:coordinator:remember", note, client("here"));
+  h.state.invalidated.length = 0;
+  await h.invoke("view:coordinator:forget", { id: added.data.notes[0].id }, client("here"));
+  NodeAssert.deepEqual(h.state.invalidated, ["view:coordinator"]);
+});
+
+NodeTest.test("the panel only calls handlers the bridge accepts and the plugin registers", () => {
+  const html = NodeFs.readFileSync(new URL("../views/coordinator.html", import.meta.url), "utf8");
+  const names = [...html.matchAll(/call\("([^"]+)"/g)].map((match) => match[1]);
+  const h = host();
+  NodeAssert.deepEqual(names.toSorted(), ["forget", "read", "remember"]);
+  for (const name of names) {
+    // The client bridge prefixes `view:<id>:` itself and rejects any other shape.
+    NodeAssert.match(name, /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/);
+    NodeAssert.ok(h.handlers.has(`view:coordinator:${name}`), name);
+  }
+  // The view's sandbox has no allow-forms, so a submit handler would never run.
+  NodeAssert.doesNotMatch(html, /<form/);
+});
+
 NodeTest.test("the status chip describes the coordinator and its workers only", async () => {
   const h = host({ threads: [thread("here"), thread("bystander")] });
   await start(h, "here");
@@ -211,6 +236,16 @@ NodeTest.test("the status chip describes the coordinator and its workers only", 
   NodeAssert.equal((await status("launched")).label, "Ready for review");
   NodeAssert.equal((await status("blocked")).tone, "warning");
   NodeAssert.equal(await status("bystander"), null);
+});
+
+NodeTest.test("the coordinator's status stays hidden when its count would be partial", async () => {
+  const h = host({ threads: [thread("here")] });
+  await start(h, "here");
+  for (let i = 0; i < 16_001; i++) h.state.threads.set(`t${i}`, thread(`t${i}`));
+  // Sorts after every filler page, the way a real worker id can.
+  h.state.threads.set("zz", delegated("zz", "coordinator-1", { isRunning: true }));
+  const result = await h.invoke("status:coordinator", {}, client("coordinator-1"));
+  NodeAssert.equal(result.data, null);
 });
 
 NodeTest.test(

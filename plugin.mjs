@@ -202,6 +202,7 @@ export function activate(ctx) {
       await ctx.storage.set(memoryKey(thread.projectId), next);
       return next.notes;
     });
+    await invalidate(["view:coordinator"]);
     return { data: { notes } };
   });
 
@@ -210,7 +211,11 @@ export function activate(ctx) {
     const coordinatorId = (await readCoordinators()).projects[thread.projectId]?.threadId;
     if (!coordinatorId || thread.archivedAt) return { data: null };
     if (thread.id === coordinatorId) {
-      const { threads } = await listThreads(thread.projectId, invocation, { calls: 10 });
+      const { threads, complete } = await listThreads(thread.projectId, invocation, {
+        calls: CALL_BUDGET,
+      });
+      // Pages follow thread ids, not activity, so a partial count could hide running work.
+      if (!complete) return { data: null };
       return { data: coordinatorStatus(groupWorkers(threads, coordinatorId)) };
     }
     return { data: isWorker(thread, coordinatorId) ? workerStatus(thread) : null };

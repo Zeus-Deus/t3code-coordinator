@@ -160,7 +160,7 @@
         white-space: nowrap;
         padding-top: 2px;
       }
-      form {
+      .add {
         display: flex;
         gap: 6px;
       }
@@ -192,10 +192,11 @@
           Decisions and conventions shared with the coordinator and its workers.
         </p>
         <ul id="notes"></ul>
-        <form id="remember">
+        <!-- Not a form: the sandbox has no allow-forms, so submit never fires. -->
+        <div class="add">
           <input id="note" maxlength="1000" placeholder="Add a note" autocomplete="off" />
-          <button type="submit">Add</button>
-        </form>
+          <button type="button" id="add">Add</button>
+        </div>
       </section>
 
       <p class="notice" id="notice" role="status"></p>
@@ -244,7 +245,7 @@
             remove.setAttribute("aria-label", "Remove note");
             remove.addEventListener("click", function () {
               remove.disabled = true;
-              call("view:coordinator:forget", { id: note.id }).then(function (result) {
+              call("forget", { id: note.id }).then(function (result) {
                 renderNotes(result.data.notes);
               }, function () {
                 remove.disabled = false;
@@ -269,7 +270,7 @@
         }
 
         function refresh() {
-          return call("view:coordinator:read").then(function (result) {
+          return call("read").then(function (result) {
             render(result.data);
           }, function () {});
         }
@@ -278,14 +279,17 @@
           if (coordinator) reveal(coordinator.threadId);
         });
 
-        $("remember").addEventListener("submit", function (event) {
-          event.preventDefault();
+        function addNote() {
           var input = $("note");
           if (!input.value.trim()) return;
-          call("view:coordinator:remember", { text: input.value }).then(function (result) {
+          call("remember", { text: input.value }).then(function (result) {
             input.value = "";
             renderNotes(result.data.notes);
           }, function () {});
+        }
+        $("add").addEventListener("click", addNote);
+        $("note").addEventListener("keydown", function (event) {
+          if (event.key === "Enter") addNote();
         });
 
         if (!t3) return notice("Open this panel inside T3 Code.");
