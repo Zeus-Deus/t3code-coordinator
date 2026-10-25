@@ -281,19 +281,27 @@
 
         function addNote() {
           var input = $("note");
-          if (!input.value.trim()) return;
-          call("remember", { text: input.value }).then(function (result) {
-            input.value = "";
-            renderNotes(result.data.notes);
-          }, function () {});
+          if (!input.value.trim() || input.disabled) return;
+          // Each call is a new operation, so a second click would save the note twice.
+          input.disabled = $("add").disabled = true;
+          call("remember", { text: input.value })
+            .then(function (result) {
+              input.value = "";
+              renderNotes(result.data.notes);
+            }, function () {})
+            .then(function () {
+              input.disabled = $("add").disabled = false;
+              input.focus();
+            });
         }
         $("add").addEventListener("click", addNote);
         $("note").addEventListener("keydown", function (event) {
-          if (event.key === "Enter") addNote();
+          if (event.key === "Enter" && !event.isComposing) addNote();
         });
 
         if (!t3) return notice("Open this panel inside T3 Code.");
-        // Context arrives once the bridge connects and again whenever the open thread changes.
+        // Context arrives when the bridge connects and again on theme changes. Each thread gets
+        // its own document, so a refresh per context is all the panel needs.
         t3.onContext(refresh);
         if (t3.context) refresh();
         if (t3.onChanged) t3.onChanged(refresh);

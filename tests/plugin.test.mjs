@@ -236,12 +236,14 @@ NodeTest.test("the status chip describes the coordinator and its workers only", 
   NodeAssert.equal((await status("launched")).label, "Ready for review");
   NodeAssert.equal((await status("blocked")).tone, "warning");
   NodeAssert.equal(await status("bystander"), null);
+  h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
+  NodeAssert.equal(await status("launched"), null);
 });
 
 NodeTest.test("the coordinator's status stays hidden when its count would be partial", async () => {
   const h = host({ threads: [thread("here")] });
   await start(h, "here");
-  for (let i = 0; i < 16_001; i++) h.state.threads.set(`t${i}`, thread(`t${i}`));
+  for (let i = 0; i < 2_001; i++) h.state.threads.set(`t${i}`, thread(`t${i}`));
   // Sorts after every filler page, the way a real worker id can.
   h.state.threads.set("zz", delegated("zz", "coordinator-1", { isRunning: true }));
   const result = await h.invoke("status:coordinator", {}, client("coordinator-1"));

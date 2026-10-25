@@ -135,7 +135,8 @@ NodeTest.test("memory refuses to grow past its budget instead of dropping old de
   let memory = { version: 1, notes: [] };
   for (let i = 0; i < MEMORY_LIMITS.notes; i++)
     memory = appendNote(memory, { id: `n${i}`, text: "x", threadId: "t", createdAt: "" });
-  NodeAssert.equal(appendNote(memory, { id: "n0", text: "again" }), memory);
+  NodeAssert.equal(appendNote(memory, { id: "n0", text: "x" }), memory);
+  NodeAssert.throws(() => appendNote(memory, { id: "n0", text: "else" }), /different note/);
   NodeAssert.throws(() => appendNote(memory, { id: "extra", text: "x" }), /memory is full/);
 });
 

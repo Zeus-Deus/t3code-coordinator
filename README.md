@@ -51,10 +51,10 @@ A worker is a `delegate_task` child of the coordinator, or a thread the coordina
 Agents find these with `t3_plugin_list` and call them with `t3_plugin_invoke`. Memory always belongs
 to the calling thread's project.
 
-| Action          | Input      | What it does                                     |
-| --------------- | ---------- | ------------------------------------------------ |
-| `memory-read`   | `{}`       | Returns the project's notes, oldest first        |
-| `memory-append` | `{ text }` | Adds one note (up to 1,000 characters, 50 notes) |
+| Action          | Input      | What it does                                               |
+| --------------- | ---------- | ---------------------------------------------------------- |
+| `memory-read`   | `{}`       | Returns the project's notes, oldest first                  |
+| `memory-append` | `{ text }` | Adds one note (up to 1,000 characters; 16 KB per project)  |
 
 The coordinator reads memory before planning and passes the relevant notes into each worker's brief,
 since a delegated worker sees only its brief.

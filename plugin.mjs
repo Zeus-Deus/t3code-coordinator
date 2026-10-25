@@ -58,7 +58,7 @@ export function activate(ctx) {
     return projects;
   };
 
-  /** The open thread, as the host reports it. Views and statuses always have one. */
+  /** The open thread, as the host reports it. */
   const contextThread = async (invocation) => {
     const threadId = invocation.context?.threadId;
     if (!threadId) throw new Error("Open a thread in the project first.");
@@ -211,14 +211,14 @@ export function activate(ctx) {
     const coordinatorId = (await readCoordinators()).projects[thread.projectId]?.threadId;
     if (!coordinatorId || thread.archivedAt) return { data: null };
     if (thread.id === coordinatorId) {
-      const { threads, complete } = await listThreads(thread.projectId, invocation, {
-        calls: CALL_BUDGET,
-      });
+      // Every page loads the whole project on the host, and the client asks every 30 seconds.
+      const { threads, complete } = await listThreads(thread.projectId, invocation, { calls: 10 });
       // Pages follow thread ids, not activity, so a partial count could hide running work.
       if (!complete) return { data: null };
       return { data: coordinatorStatus(groupWorkers(threads, coordinatorId)) };
     }
-    return { data: isWorker(thread, coordinatorId) ? workerStatus(thread) : null };
+    if (!isWorker(thread, coordinatorId)) return { data: null };
+    return { data: (await liveCoordinator(thread.projectId)) ? workerStatus(thread) : null };
   });
 
   ctx.trees.register("coordinator", async (invocation) => {
@@ -238,7 +238,7 @@ export function activate(ctx) {
       );
       if (coordinator) sections.push({ projectId, coordinator, threads });
       if (!complete) {
-        ctx.log("info", "The Coordinator tree is bounded; remaining threads stay in Other.");
+        ctx.log("debug", "The Coordinator tree is bounded; remaining threads stay in Other.");
         break;
       }
     }
