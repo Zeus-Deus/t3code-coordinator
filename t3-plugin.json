@@ -1,0 +1,56 @@
+{
+  "id": "zeus-deus.coordinator",
+  "name": "Project Coordinator",
+  "description": "One long-running coordinator thread per project. It delegates work to parallel workers through T3, and an overview groups them by state. Agents share a short project memory.",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "entry": "plugin.mjs",
+  "capabilities": [
+    "storage",
+    "threads.read",
+    "workflow.query",
+    "threads.create",
+    "ui",
+    "ui.native-trees",
+    "ui.changes"
+  ],
+  "actions": [
+    {
+      "id": "coordinator",
+      "title": "Project coordinator",
+      "description": "Open this project's coordinator, or start one.",
+      "placements": ["palette", "thread-menu"]
+    },
+    {
+      "id": "memory-read",
+      "title": "Read project memory",
+      "description": "Read your project's shared notes: decisions, conventions and context every worker should know. Returns {notes: [{id, text, threadId, createdAt}]}, oldest first. Include the relevant notes when you brief a worker.",
+      "placements": [],
+      "agentCallable": true
+    },
+    {
+      "id": "memory-append",
+      "title": "Add to project memory",
+      "description": "Add one durable note to your project's shared memory. Input: {text} (up to 1000 characters). Record decisions and conventions, not progress. Reuse the operationId when retrying.",
+      "placements": [],
+      "agentCallable": true
+    }
+  ],
+  "views": [
+    {
+      "id": "coordinator",
+      "title": "Coordinator",
+      "entry": "views/coordinator.html",
+      "placement": "side-panel"
+    }
+  ],
+  "threadStatus": [{ "id": "coordinator", "title": "Coordinator", "icon": "bot", "viewId": "coordinator" }],
+  "nativeTrees": [
+    {
+      "id": "coordinator",
+      "title": "Coordinator",
+      "description": "Each project's coordinator, with its workers grouped by state."
+    }
+  ],
+  "settings": []
+}
