@@ -176,6 +176,7 @@
             <button type="button" id="open">Open</button>
           </div>
         </div>
+        <p class="hint" id="self" hidden>This thread is the project's coordinator.</p>
         <p class="hint" id="current-hint" hidden>
           Choose <strong>Coordinator</strong> in the sidebar's view menu to see its workers:
           needs you, working, ready for review and done.
@@ -259,12 +260,12 @@
 
         function render(data) {
           coordinator = data.coordinator;
-          $("current").hidden = !coordinator;
+          $("current").hidden = !coordinator || data.isCoordinator;
+          $("self").hidden = !data.isCoordinator;
           $("current-hint").hidden = !coordinator;
           $("none").hidden = !!coordinator;
           if (coordinator) {
             $("current-title").textContent = coordinator.title;
-            $("open").hidden = data.isCoordinator;
           }
           renderNotes(data.notes);
         }
