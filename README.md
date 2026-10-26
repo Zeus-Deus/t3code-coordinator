@@ -31,7 +31,8 @@ beside a given thread.
   Select a thread to open it with the Overview still beside it; **Coordinator** at the top of the
   Overview, or the breadcrumb, takes you back.
 - The thread header shows **Overview** with a short status, such as **Overview · 1 waiting on
-  you**. Select it to open the Overview.
+  you**. Select it to open the Overview. It reads **Waiting on you** when the coordinator itself
+  has a pending approval or question.
 - The gear in the Overview opens the **Project memory**. You can add or remove notes there.
 
 T3's sidebar is unchanged: the coordinator is one row in its project, and the threads it delegates
@@ -85,6 +86,9 @@ These need T3 changes, so the plugin doesn't work around them:
 - **Workers in other environments.** Waits on T3's linked-environment MCP work.
 - **Memory in every run automatically.** Needs a host hook that adds context before a run starts.
   Until then, the coordinator includes memory in each brief.
+- **A question asked in plain text.** T3 only flags a thread as waiting for a pending approval or
+  question request, so when the coordinator asks "Shall I merge?" in its reply, the Overview still
+  reads **All threads done**.
 - **A cloud runtime** for coordinators that keep working while your machine is off.
 
 ## Development

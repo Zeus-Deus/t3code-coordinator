@@ -3,11 +3,9 @@
 import {
   appendNote,
   BRIEF,
-  coordinatorStatus,
   decodeCoordinators,
   decodeMemory,
   GUIDE,
-  groupWorkers,
   hashId,
   isWorker,
   memoryKey,
@@ -224,7 +222,7 @@ export function activate(ctx) {
       const scan = await listThreads(thread.projectId, invocation, { calls: SCAN_PAGES });
       // Pages follow thread ids, not activity, so a partial count could hide running work.
       if (!scan.complete) return { data: null };
-      return { data: coordinatorStatus(groupWorkers(scan.threads, coordinatorId)) };
+      return { data: overview(scan.threads, coordinatorId).status };
     }
     if (!isWorker(thread, coordinatorId)) return { data: null };
     return { data: (await liveCoordinator(thread.projectId)) ? workerStatus(thread) : null };

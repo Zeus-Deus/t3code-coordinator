@@ -241,6 +241,10 @@ NodeTest.test("the status chip describes the coordinator and its workers only", 
   NodeAssert.equal((await status("launched")).label, "Ready for review");
   NodeAssert.equal((await status("blocked")).tone, "warning");
   NodeAssert.equal(await status("bystander"), null);
+  h.state.threads.get("blocked").needsAttention = false;
+  h.state.threads.get("busy").isRunning = false;
+  h.state.threads.get("coordinator-1").needsAttention = true;
+  NodeAssert.equal((await status("coordinator-1")).label, "Waiting on you");
   h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
   NodeAssert.equal(await status("launched"), null);
 });

@@ -88,6 +88,10 @@ NodeTest.test("the coordinator's status leads with what is waiting on the person
   NodeAssert.equal(coordinatorStatus({ ...idle, ready: many("r", 2) }).tone, "success");
   NodeAssert.deepEqual(coordinatorStatus(idle), { label: "No threads yet", tone: "neutral" });
   NodeAssert.equal(coordinatorStatus({ ...idle, done: [{}] }).label, "All threads done");
+  NodeAssert.deepEqual(coordinatorStatus({ ...idle, done: [{}] }, { needsAttention: true }), {
+    label: "Waiting on you",
+    tone: "warning",
+  });
 });
 
 NodeTest.test("the overview lists only groups with threads, in the order a person acts on", () => {
