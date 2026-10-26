@@ -394,13 +394,18 @@
           var root = $("groups");
           root.replaceChildren();
           // Done folds away while anything is still in flight; on its own it is the whole story.
+          // It also stays open while it holds the open thread, so the selection never hides.
           var alone = overview.groups.length === 1;
           overview.groups.forEach(function (group) {
             var done = group.id === "done";
-            var open = !done || alone || state.doneOpen;
+            var holdsCurrent = group.threads.some(function (thread) {
+              return thread.threadId === state.data.current;
+            });
+            var foldable = done && !alone && !holdsCurrent;
+            var open = !foldable || state.doneOpen;
             var section = el("div", "group" + (open ? " open" : ""));
-            var label = el(done && !alone ? "button" : "div", "label");
-            if (done && !alone) {
+            var label = el(foldable ? "button" : "div", "label");
+            if (foldable) {
               label.type = "button";
               label.setAttribute("aria-expanded", String(state.doneOpen));
               label.append(icon("chevron"));
