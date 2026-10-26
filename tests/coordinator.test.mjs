@@ -87,7 +87,7 @@ NodeTest.test("the coordinator's status leads with what is waiting on the person
   NodeAssert.ok(busy.label.length <= 40);
   NodeAssert.equal(coordinatorStatus({ ...idle, ready: many("r", 2) }).tone, "success");
   NodeAssert.deepEqual(coordinatorStatus(idle), { label: "No threads yet", tone: "neutral" });
-  NodeAssert.equal(coordinatorStatus({ ...idle, done: [{}] }).label, "All done");
+  NodeAssert.equal(coordinatorStatus({ ...idle, done: [{}] }).label, "All threads done");
 });
 
 NodeTest.test("the overview lists only groups with threads, in the order a person acts on", () => {
@@ -95,7 +95,7 @@ NodeTest.test("the overview lists only groups with threads, in the order a perso
     [
       thread("c"),
       delegated("done", "c", { settledAt: "2026-10-01" }),
-      delegated("run", "c", { isRunning: true, branch: "t3/run" }),
+      delegated("run", "c", { isRunning: true }),
       delegated("ask", "c", { needsAttention: true }),
     ],
     "c",
@@ -108,7 +108,6 @@ NodeTest.test("the overview lists only groups with threads, in the order a perso
       ["Done", ["done"]],
     ],
   );
-  NodeAssert.equal(view.groups[1].threads[0].branch, "t3/run");
   NodeAssert.equal(view.status.label, "1 waiting on you");
 });
 

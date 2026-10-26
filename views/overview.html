@@ -122,6 +122,11 @@
       .hint {
         padding: 0 4px 8px;
       }
+      .groups {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
       .group {
         display: flex;
         flex-direction: column;
@@ -131,7 +136,7 @@
         align-items: center;
         gap: 6px;
         width: 100%;
-        padding: 4px 4px 4px;
+        padding: 0 10px 4px;
         color: var(--muted);
         font-size: 12px;
         font-weight: 500;
@@ -144,42 +149,35 @@
       .label svg {
         width: 12px;
         height: 12px;
+        margin-left: -2px;
         transition: transform 120ms ease;
       }
       .group.open .label svg {
         transform: rotate(90deg);
       }
+      /* Matches T3's sidebar rows: 14px text, 36px tall, a hover fill and a stronger active fill. */
       .row {
         display: flex;
-        align-items: flex-start;
-        gap: 8px;
+        align-items: center;
+        gap: 10px;
         width: 100%;
-        padding: 6px 4px;
+        min-height: 36px;
+        padding: 0 10px;
         border-radius: calc(var(--radius) - 2px);
+        font-size: 14px;
         text-align: left;
       }
       .row:hover {
         background: var(--muted-bg);
       }
-      .row svg {
-        margin-top: 2px;
-      }
-      .row .text {
-        display: flex;
-        flex-direction: column;
-        min-width: 0;
+      .row[aria-current="true"] {
+        background: color-mix(in srgb, var(--fg) 11%, transparent);
       }
       .row .title {
+        min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-      }
-      .row .branch {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        color: var(--muted);
-        font: 11.5px/1.4 var(--mono);
       }
       .waiting {
         color: var(--warning);
@@ -191,7 +189,7 @@
         color: var(--success);
       }
       .done,
-      .done + .text .title {
+      .done + .title {
         color: var(--muted);
       }
       .back {
@@ -315,7 +313,7 @@
       </section>
 
       <section id="threads" hidden>
-        <div id="groups"></div>
+        <div class="groups" id="groups"></div>
         <div class="empty" id="no-threads" hidden>
           <p>No threads yet.</p>
           <p class="muted">
@@ -395,11 +393,14 @@
         function renderGroups(overview) {
           var root = $("groups");
           root.replaceChildren();
+          // Done folds away while anything is still in flight; on its own it is the whole story.
+          var alone = overview.groups.length === 1;
           overview.groups.forEach(function (group) {
             var done = group.id === "done";
-            var section = el("div", "group" + (done && !state.doneOpen ? "" : " open"));
-            var label = el(done ? "button" : "div", "label");
-            if (done) {
+            var open = !done || alone || state.doneOpen;
+            var section = el("div", "group" + (open ? " open" : ""));
+            var label = el(done && !alone ? "button" : "div", "label");
+            if (done && !alone) {
               label.type = "button";
               label.setAttribute("aria-expanded", String(state.doneOpen));
               label.append(icon("chevron"));
@@ -413,14 +414,13 @@
               el("span", "count", String(group.threads.length)),
             );
             section.append(label);
-            if (!done || state.doneOpen) {
+            if (open) {
               group.threads.forEach(function (thread) {
                 var row = el("button", "row");
                 row.type = "button";
-                var text = el("span", "text");
-                text.append(el("span", "title", thread.title));
-                if (thread.branch) text.append(el("span", "branch", thread.branch));
-                row.append(icon(group.id, group.id), text);
+                if (thread.threadId === state.data.current)
+                  row.setAttribute("aria-current", "true");
+                row.append(icon(group.id, group.id), el("span", "title", thread.title));
                 row.addEventListener("click", function () {
                   reveal(thread.threadId);
                 });

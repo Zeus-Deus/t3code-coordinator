@@ -185,6 +185,7 @@ export function activate(ctx) {
         project: projects.get(thread.projectId)?.title ?? null,
         coordinator: coordinator && { threadId: coordinator.id, title: coordinator.title },
         isCoordinator: coordinator?.id === thread.id,
+        current: thread.id,
         // A partial scan could hide running work, so the panel says so instead of guessing.
         overview: scan?.complete ? overview(scan.threads, coordinator.id) : null,
         notes,
