@@ -22,6 +22,13 @@
       "placements": ["palette", "thread-menu"]
     },
     {
+      "id": "guide",
+      "title": "Read the coordinator guide",
+      "description": "The coordinator's playbook: how to scope the goal, delegate workers through T3, review their results and assemble them. Read it at the start of a coordinator conversation, and again whenever you need it.",
+      "placements": [],
+      "agentCallable": true
+    },
+    {
       "id": "memory-read",
       "title": "Read project memory",
       "description": "Read your project's shared notes: decisions, conventions and context every worker should know. Returns {notes: [{id, text, threadId, createdAt}]}, oldest first. Include the relevant notes when you brief a worker.",

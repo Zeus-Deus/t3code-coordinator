@@ -2,10 +2,11 @@ import * as NodeAssert from "node:assert/strict";
 import * as NodeTest from "node:test";
 import {
   appendNote,
-  brief,
+  BRIEF,
   buildTree,
   coordinatorStatus,
   decodeCoordinators,
+  GUIDE,
   groupWorkers,
   isWorker,
   MEMORY_LIMITS,
@@ -145,9 +146,10 @@ NodeTest.test("stored data from an unknown version is refused, not overwritten",
   NodeAssert.throws(() => decodeCoordinators({ version: 2, projects: {} }), /unknown format/);
 });
 
-NodeTest.test("the brief points at T3's own orchestration tools and asks for the goal", () => {
-  const text = brief();
-  for (const tool of ["delegate_task", "t3_plugin_invoke", "memory-read", "t3_thread_organize"])
-    NodeAssert.ok(text.includes(tool), tool);
-  NodeAssert.match(text, /ask what this project should accomplish/);
+NodeTest.test("the first message stays short and hands off to the guide", () => {
+  NodeAssert.ok(BRIEF.length <= 120, `${BRIEF.length} characters`);
+  NodeAssert.match(BRIEF, /guide action/);
+  for (const tool of ["delegate_task", "memory-read", "memory-append", "t3_thread_organize"])
+    NodeAssert.ok(GUIDE.includes(tool), tool);
+  NodeAssert.match(GUIDE, /ask what this project should accomplish/);
 });

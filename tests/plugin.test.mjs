@@ -115,7 +115,7 @@ NodeTest.test("opening twice keeps one coordinator, started in default mode", as
   const [request] = h.state.created;
   NodeAssert.equal(request.title, "Demo");
   NodeAssert.equal(request.interactionMode, "default");
-  NodeAssert.match(request.text, /delegate_task/);
+  NodeAssert.match(request.text, /guide action/);
   NodeAssert.ok(h.state.invalidated.includes("tree:coordinator"));
 });
 
@@ -144,6 +144,12 @@ NodeTest.test("an archived or deleted coordinator is replaced on the next open",
   h.state.threads.get("coordinator-2").deleted = true;
   await start(h, "here");
   NodeAssert.equal(h.state.created.length, 3);
+});
+
+NodeTest.test("any agent can read the coordinator guide", async () => {
+  const h = host({ threads: [thread("worker")] });
+  const result = await h.invoke("action:guide", {}, agent("worker"));
+  NodeAssert.match(result.message, /delegate_task/);
 });
 
 NodeTest.test("opening without a project explains itself", async () => {

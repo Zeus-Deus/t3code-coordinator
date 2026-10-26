@@ -7,7 +7,7 @@ The sidebar groups its workers into **Needs you**, **Working**, **Ready for revi
 Agents share a short project memory.
 
 The plugin is small on purpose. T3 already runs, isolates, and reports back on delegated work.
-This plugin starts the coordinator with a good brief, recognizes its workers, shows where they
+This plugin starts the coordinator, gives it a playbook, recognizes its workers, shows where they
 stand, and keeps the memory. It never starts a worker itself.
 
 ## Install
@@ -53,11 +53,14 @@ to the calling thread's project.
 
 | Action          | Input      | What it does                                               |
 | --------------- | ---------- | ---------------------------------------------------------- |
+| `guide`         | `{}`       | Returns the coordinator's playbook                         |
 | `memory-read`   | `{}`       | Returns the project's notes, oldest first                  |
 | `memory-append` | `{ text }` | Adds one note (up to 1,000 characters; 16 KB per project)  |
 
-The coordinator reads memory before planning and passes the relevant notes into each worker's brief,
-since a delegated worker sees only its brief.
+A new coordinator's first message is one line asking it to read the guide. The playbook lives in
+the `guide` action rather than the thread, so a long-running coordinator can reread it after its
+conversation is compacted. The coordinator reads memory before planning and passes the relevant
+notes into each worker's brief, since a delegated worker sees only its brief.
 
 ## Why there is no completion relay
 

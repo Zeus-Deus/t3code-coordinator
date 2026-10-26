@@ -2,11 +2,12 @@
 // project memory. Delegation stays in T3's orchestration tools; this plugin never starts workers.
 import {
   appendNote,
-  brief,
+  BRIEF,
   buildTree,
   coordinatorStatus,
   decodeCoordinators,
   decodeMemory,
+  GUIDE,
   groupWorkers,
   hashId,
   isWorker,
@@ -103,7 +104,7 @@ export function activate(ctx) {
       const { threadId } = await ctx.threads.create({
         projectId,
         title: projects.get(projectId)?.title ?? "Coordinator",
-        text: brief(),
+        text: BRIEF,
         // A plan-mode source thread would otherwise make the coordinator and its workers plan-only.
         interactionMode: "default",
         idempotencyKey: "start-coordinator",
@@ -144,6 +145,8 @@ export function activate(ctx) {
       ],
     };
   });
+
+  ctx.handle("action:guide", () => ({ message: GUIDE }));
 
   ctx.handle("action:memory-read", async (_input, invocation) => {
     const { projectId } = await agentThread(invocation);
