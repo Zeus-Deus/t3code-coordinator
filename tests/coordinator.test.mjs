@@ -3,14 +3,13 @@ import * as NodeTest from "node:test";
 import {
   appendNote,
   BRIEF,
-  buildTree,
   coordinatorStatus,
   decodeCoordinators,
   GUIDE,
   groupWorkers,
   isWorker,
   MEMORY_LIMITS,
-  TREE_LIMITS,
+  overview,
   workerState,
 } from "../lib/coordinator.mjs";
 
@@ -50,10 +49,7 @@ NodeTest.test("workers are the coordinator's own delegations and launches, nothi
 });
 
 NodeTest.test("attention outranks running, and a person's unsettle beats an old settle", () => {
-  NodeAssert.equal(
-    workerState(thread("a", { isRunning: true, needsAttention: true })),
-    "needs-you",
-  );
+  NodeAssert.equal(workerState(thread("a", { isRunning: true, needsAttention: true })), "waiting");
   NodeAssert.equal(workerState(thread("a", { isRunning: true })), "working");
   NodeAssert.equal(workerState(thread("a", { settledAt: "2026-10-01" })), "done");
   NodeAssert.equal(workerState(thread("a", { settledOverride: "settled" })), "done");
@@ -64,72 +60,56 @@ NodeTest.test("attention outranks running, and a person's unsettle beats an old 
   NodeAssert.equal(workerState(thread("a")), "ready");
 });
 
-NodeTest.test("groups skip archived workers and list the newest first", () => {
+NodeTest.test("groups skip archived workers and keep creation order as activity changes", () => {
   const groups = groupWorkers(
     [
-      delegated("old", "c", { updatedAt: "2026-10-01T00:00:00Z" }),
-      delegated("new", "c", { updatedAt: "2026-10-24T00:00:00Z" }),
+      delegated("second", "c", { createdAt: "2026-10-02T00:00:00Z", updatedAt: "2026-10-01" }),
+      delegated("first", "c", { createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-24" }),
       delegated("gone", "c", { archivedAt: "2026-10-02" }),
     ],
     "c",
   );
   NodeAssert.deepEqual(
     groups.ready.map((t) => t.id),
-    ["new", "old"],
+    ["first", "second"],
   );
 });
 
-NodeTest.test("the coordinator's status counts what needs a look, within 40 characters", () => {
+NodeTest.test("the coordinator's status leads with what is waiting on the person", () => {
   const many = (state, n) => Array.from({ length: n }, (_, i) => ({ id: `${state}${i}` }));
-  const status = coordinatorStatus({
-    "needs-you": many("n", 12),
-    working: many("w", 12),
-    ready: many("r", 12),
-    done: [],
-  });
-  NodeAssert.equal(status.label, "12 needs you · 12 working · 12 to review");
-  NodeAssert.ok(status.label.length <= 40);
-  NodeAssert.equal(status.tone, "warning");
-  const idle = { "needs-you": [], working: [], ready: [], done: [] };
-  NodeAssert.deepEqual(coordinatorStatus(idle), { label: "No workers yet", tone: "neutral" });
+  const idle = { waiting: [], working: [], ready: [], done: [] };
+  NodeAssert.deepEqual(
+    coordinatorStatus({ ...idle, waiting: many("n", 1), working: many("w", 2) }),
+    { label: "1 waiting on you", tone: "warning" },
+  );
+  const busy = coordinatorStatus({ ...idle, working: many("w", 12), ready: many("r", 12) });
+  NodeAssert.deepEqual(busy, { label: "12 working · 12 ready for review", tone: "info" });
+  NodeAssert.ok(busy.label.length <= 40);
+  NodeAssert.equal(coordinatorStatus({ ...idle, ready: many("r", 2) }).tone, "success");
+  NodeAssert.deepEqual(coordinatorStatus(idle), { label: "No threads yet", tone: "neutral" });
   NodeAssert.equal(coordinatorStatus({ ...idle, done: [{}] }).label, "All done");
 });
 
-NodeTest.test("the tree puts state groups beside the coordinator row, with safe node ids", () => {
-  const tree = buildTree([
-    {
-      projectId: "project:1",
-      coordinator: thread("thread:c%3A1"),
-      threads: [
-        thread("thread:c%3A1"),
-        delegated("w1", "thread:c%3A1", { isRunning: true }),
-        delegated("w2", "thread:c%3A1", { settledAt: "2026-10-01" }),
-      ],
-    },
-  ]);
-  const [project, coordinator, ...rest] = tree.nodes;
-  NodeAssert.equal(project.kind, "project");
-  NodeAssert.equal(coordinator.threadId, "thread:c%3A1");
-  NodeAssert.equal(coordinator.parentId, project.id);
-  const groups = rest.filter((n) => n.kind === "group");
-  NodeAssert.deepEqual(
-    groups.map((g) => [g.title, g.parentId, g.collapsedByDefault ?? false]),
+NodeTest.test("the overview lists only groups with threads, in the order a person acts on", () => {
+  const view = overview(
     [
-      ["Working", project.id, false],
-      ["Done", project.id, true],
+      thread("c"),
+      delegated("done", "c", { settledAt: "2026-10-01" }),
+      delegated("run", "c", { isRunning: true, branch: "t3/run" }),
+      delegated("ask", "c", { needsAttention: true }),
+    ],
+    "c",
+  );
+  NodeAssert.deepEqual(
+    view.groups.map((g) => [g.title, g.threads.map((t) => t.threadId)]),
+    [
+      ["Waiting on you", ["ask"]],
+      ["Working", ["run"]],
+      ["Done", ["done"]],
     ],
   );
-  for (const node of tree.nodes) NodeAssert.match(node.id, /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/);
-});
-
-NodeTest.test("the tree stays inside the host's node and byte limits", () => {
-  const threads = [thread("c")];
-  for (let i = 0; i < 5000; i++) threads.push(delegated(`${"長".repeat(60)}${i}`));
-  const tree = buildTree([{ projectId: "p", coordinator: threads[0], threads }]);
-  NodeAssert.ok(tree.nodes.length <= TREE_LIMITS.nodes);
-  NodeAssert.ok(Buffer.byteLength(JSON.stringify(tree)) <= TREE_LIMITS.bytes);
-  const ids = new Set(tree.nodes.map((n) => n.id));
-  for (const node of tree.nodes) NodeAssert.ok(!node.parentId || ids.has(node.parentId));
+  NodeAssert.equal(view.groups[1].threads[0].branch, "t3/run");
+  NodeAssert.equal(view.status.label, "1 waiting on you");
 });
 
 NodeTest.test("memory refuses to grow past its budget instead of dropping old decisions", () => {

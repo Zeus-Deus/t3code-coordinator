@@ -1,7 +1,7 @@
 {
   "id": "zeus-deus.coordinator",
   "name": "Project Coordinator",
-  "description": "One long-running coordinator thread per project. It delegates work to parallel workers through T3, and an overview groups them by state. Agents share a short project memory.",
+  "description": "One long-running coordinator thread per project. It hands work to parallel threads through T3, and an Overview beside it shows which threads are working, waiting on you or ready for review. Agents share a short project memory.",
   "version": "0.1.0",
   "apiVersion": 1,
   "entry": "plugin.mjs",
@@ -11,7 +11,6 @@
     "workflow.query",
     "threads.create",
     "ui",
-    "ui.native-trees",
     "ui.changes"
   ],
   "actions": [
@@ -45,18 +44,18 @@
   ],
   "views": [
     {
-      "id": "coordinator",
-      "title": "Coordinator",
-      "entry": "views/coordinator.html",
+      "id": "overview",
+      "title": "Overview",
+      "entry": "views/overview.html",
       "placement": "side-panel"
     }
   ],
-  "threadStatus": [{ "id": "coordinator", "title": "Coordinator", "icon": "bot", "viewId": "coordinator" }],
-  "nativeTrees": [
+  "threadStatus": [
     {
-      "id": "coordinator",
-      "title": "Coordinator",
-      "description": "Each project's coordinator, with its workers grouped by state."
+      "id": "overview",
+      "title": "Overview",
+      "icon": "activity",
+      "viewId": "overview"
     }
   ],
   "settings": []

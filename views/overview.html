@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Overview</title>
+    <style>
+      /* T3 applies its theme variables to <html>; the fallbacks cover the first paint. */
+      :root {
+        --bg: var(--color-background-primary, #ffffff);
+        --muted-bg: var(--color-background-tertiary, #f1f1f3);
+        --fg: var(--color-text-primary, #111113);
+        --muted: var(--color-text-secondary, #6b6b74);
+        --border: var(--color-border-primary, #e6e6e9);
+        --input: var(--color-border-secondary, #d6d6da);
+        --ring: var(--color-ring-primary, #6b6bff);
+        --info: var(--color-text-info, #2563eb);
+        --success: var(--color-text-success, #15803d);
+        --warning: var(--color-text-warning, #b45309);
+        --danger: var(--color-text-danger, #b42318);
+        --radius: var(--border-radius-md, 8px);
+        --font: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+        --mono: var(--font-mono, ui-monospace, monospace);
+        color-scheme: light dark;
+      }
+      html[data-t3-theme="dark"] {
+        --bg: var(--color-background-primary, #0b0b0c);
+        --muted-bg: var(--color-background-tertiary, #1c1c1f);
+        --fg: var(--color-text-primary, #ededef);
+        --muted: var(--color-text-secondary, #a1a1aa);
+        --border: var(--color-border-primary, #26262b);
+        --input: var(--color-border-secondary, #34343a);
+        --info: var(--color-text-info, #60a5fa);
+        --success: var(--color-text-success, #4ade80);
+        --warning: var(--color-text-warning, #fbbf24);
+        --danger: var(--color-text-danger, #f87171);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      html,
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px/1.45 var(--font);
+      }
+      main {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding: 14px 12px 24px;
+      }
+      p {
+        margin: 0;
+      }
+      button,
+      input {
+        font: inherit;
+        color: inherit;
+      }
+      button {
+        border: 0;
+        background: none;
+        padding: 0;
+        cursor: pointer;
+      }
+      button:focus-visible,
+      input:focus-visible {
+        outline: 2px solid var(--ring);
+        outline-offset: 1px;
+      }
+      svg {
+        flex: none;
+        width: 14px;
+        height: 14px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 0 0 0 4px;
+      }
+      .name {
+        font-size: 14px;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .muted {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .titles {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .icon-button {
+        display: grid;
+        place-items: center;
+        width: 28px;
+        height: 28px;
+        border-radius: calc(var(--radius) - 2px);
+        color: var(--muted);
+      }
+      .icon-button:hover {
+        background: var(--muted-bg);
+        color: var(--fg);
+      }
+      .hint {
+        padding: 0 4px 8px;
+      }
+      .group {
+        display: flex;
+        flex-direction: column;
+      }
+      .label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        width: 100%;
+        padding: 4px 4px 4px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 500;
+        text-align: left;
+      }
+      .label .count {
+        margin-left: auto;
+        font-variant-numeric: tabular-nums;
+      }
+      .label svg {
+        width: 12px;
+        height: 12px;
+        transition: transform 120ms ease;
+      }
+      .group.open .label svg {
+        transform: rotate(90deg);
+      }
+      .row {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        width: 100%;
+        padding: 6px 4px;
+        border-radius: calc(var(--radius) - 2px);
+        text-align: left;
+      }
+      .row:hover {
+        background: var(--muted-bg);
+      }
+      .row svg {
+        margin-top: 2px;
+      }
+      .row .text {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+      .row .title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .row .branch {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--muted);
+        font: 11.5px/1.4 var(--mono);
+      }
+      .waiting {
+        color: var(--warning);
+      }
+      .working {
+        color: var(--info);
+      }
+      .ready {
+        color: var(--success);
+      }
+      .done,
+      .done + .text .title {
+        color: var(--muted);
+      }
+      .back {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        align-self: flex-start;
+        padding: 2px 4px;
+        border-radius: calc(var(--radius) - 2px);
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .back:hover {
+        color: var(--fg);
+      }
+      .empty {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 20px 4px;
+      }
+      .notes {
+        display: flex;
+        flex-direction: column;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      .notes li {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        padding: 7px 4px;
+        border-radius: calc(var(--radius) - 2px);
+      }
+      .notes li:hover {
+        background: var(--muted-bg);
+      }
+      .notes p {
+        flex: 1;
+        min-width: 0;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .notes button {
+        color: var(--muted);
+        visibility: hidden;
+      }
+      .notes li:hover button,
+      .notes button:focus-visible {
+        visibility: visible;
+      }
+      .add {
+        display: flex;
+        gap: 6px;
+      }
+      .add input {
+        flex: 1;
+        min-width: 0;
+        height: 30px;
+        padding: 0 10px;
+        border: 1px solid var(--input);
+        border-radius: calc(var(--radius) - 2px);
+        background: var(--bg);
+      }
+      .add button {
+        height: 30px;
+        padding: 0 12px;
+        border: 1px solid var(--input);
+        border-radius: calc(var(--radius) - 2px);
+        font-size: 12px;
+        font-weight: 500;
+      }
+      .add button:hover:not(:disabled) {
+        background: var(--muted-bg);
+      }
+      .notice {
+        color: var(--danger);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+      .notice:empty {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <button type="button" class="back" id="back" hidden>
+        <svg viewBox="0 0 24 24">
+          <path d="m12 19-7-7 7-7" />
+          <path d="M19 12H5" />
+        </svg>
+        <span id="back-label">Coordinator</span>
+      </button>
+      <header class="head">
+        <div class="titles">
+          <span class="name" id="name">Overview</span>
+          <span class="muted" id="summary"></span>
+        </div>
+        <button
+          type="button"
+          class="icon-button"
+          id="open-memory"
+          aria-label="Project memory"
+          title="Project memory"
+          hidden
+        >
+          <svg viewBox="0 0 24 24">
+            <path
+              d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"
+            />
+            <circle cx="12" cy="12" r="3" />
+          </svg>
+        </button>
+      </header>
+
+      <section id="none" class="empty" hidden>
+        <p>This project has no coordinator yet.</p>
+        <p class="muted">Run <strong>Open project coordinator</strong> from the command palette.</p>
+      </section>
+
+      <section id="threads" hidden>
+        <div id="groups"></div>
+        <div class="empty" id="no-threads" hidden>
+          <p>No threads yet.</p>
+          <p class="muted">
+            Tell the coordinator what to work on. Each piece of work becomes a thread here.
+          </p>
+        </div>
+        <p class="muted" id="partial" hidden>This project has too many threads to group here.</p>
+      </section>
+
+      <section id="memory" hidden>
+        <p class="muted hint">
+          Decisions and conventions the coordinator keeps, and passes on to the threads it starts.
+        </p>
+        <ul class="notes" id="notes"></ul>
+        <div class="add">
+          <input id="note" maxlength="1000" placeholder="Add a note" autocomplete="off" />
+          <button type="button" id="add">Add</button>
+        </div>
+      </section>
+
+      <p class="notice" id="notice" role="status"></p>
+    </main>
+    <script>
+      (function () {
+        "use strict";
+        var t3 = window.t3;
+        var $ = function (id) {
+          return document.getElementById(id);
+        };
+        var ICONS = {
+          working:
+            '<path d="M10.1 2.182a10 10 0 0 1 3.8 0"/><path d="M13.9 21.818a10 10 0 0 1-3.8 0"/><path d="M17.609 3.721a10 10 0 0 1 2.69 2.7"/><path d="M2.182 13.9a10 10 0 0 1 0-3.8"/><path d="M20.279 17.609a10 10 0 0 1-2.7 2.69"/><path d="M21.818 10.1a10 10 0 0 1 0 3.8"/><path d="M3.721 6.391a10 10 0 0 1 2.7-2.69"/><path d="M6.391 20.279a10 10 0 0 1-2.69-2.7"/>',
+          waiting:
+            '<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>',
+          ready: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+          done: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+          chevron: '<path d="m9 18 6-6-6-6"/>',
+          remove: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+        };
+        var state = { memory: false, data: null, doneOpen: false };
+
+        function icon(name, className) {
+          var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          svg.setAttribute("viewBox", "0 0 24 24");
+          svg.setAttribute("aria-hidden", "true");
+          if (className) svg.setAttribute("class", className);
+          svg.innerHTML = ICONS[name];
+          return svg;
+        }
+
+        function el(tag, className, text) {
+          var node = document.createElement(tag);
+          if (className) node.className = className;
+          if (text !== undefined) node.textContent = text;
+          return node;
+        }
+
+        function notice(error) {
+          $("notice").textContent = error ? String(error.message || error) : "";
+        }
+
+        function call(name, input) {
+          notice(null);
+          if (!t3) return Promise.reject(new Error("Open this panel inside T3 Code."));
+          return t3.invoke(name, input).catch(function (error) {
+            notice(error);
+            throw error;
+          });
+        }
+
+        // Opens the thread with this Overview still beside it, so the person never loses the map.
+        function reveal(threadId) {
+          if (!t3 || !t3.intent) return notice("Update T3 Code to open threads from here.");
+          t3.intent({ type: "view.open", viewId: "overview", threadId: threadId }).catch(notice);
+        }
+
+        function renderGroups(overview) {
+          var root = $("groups");
+          root.replaceChildren();
+          overview.groups.forEach(function (group) {
+            var done = group.id === "done";
+            var section = el("div", "group" + (done && !state.doneOpen ? "" : " open"));
+            var label = el(done ? "button" : "div", "label");
+            if (done) {
+              label.type = "button";
+              label.setAttribute("aria-expanded", String(state.doneOpen));
+              label.append(icon("chevron"));
+              label.addEventListener("click", function () {
+                state.doneOpen = !state.doneOpen;
+                renderGroups(overview);
+              });
+            }
+            label.append(
+              el("span", "", group.title),
+              el("span", "count", String(group.threads.length)),
+            );
+            section.append(label);
+            if (!done || state.doneOpen) {
+              group.threads.forEach(function (thread) {
+                var row = el("button", "row");
+                row.type = "button";
+                var text = el("span", "text");
+                text.append(el("span", "title", thread.title));
+                if (thread.branch) text.append(el("span", "branch", thread.branch));
+                row.append(icon(group.id, group.id), text);
+                row.addEventListener("click", function () {
+                  reveal(thread.threadId);
+                });
+                section.append(row);
+              });
+            }
+            root.append(section);
+          });
+        }
+
+        function renderNotes(notes) {
+          var list = $("notes");
+          list.replaceChildren();
+          notes.forEach(function (note) {
+            var remove = el("button");
+            remove.type = "button";
+            remove.setAttribute("aria-label", "Remove note");
+            remove.append(icon("remove"));
+            remove.addEventListener("click", function () {
+              remove.disabled = true;
+              call("forget", { id: note.id }).then(
+                function (result) {
+                  state.data.notes = result.data.notes;
+                  renderNotes(result.data.notes);
+                },
+                function () {
+                  remove.disabled = false;
+                },
+              );
+            });
+            var item = el("li");
+            item.append(el("p", "", note.text), remove);
+            list.append(item);
+          });
+        }
+
+        function render() {
+          var data = state.data;
+          var coordinator = data.coordinator;
+          var memory = coordinator && state.memory;
+          $("name").textContent = memory ? "Project memory" : data.project || "Overview";
+          $("summary").textContent = memory
+            ? data.project || ""
+            : data.overview
+              ? data.overview.status.label
+              : "";
+          $("none").hidden = !!coordinator;
+          $("open-memory").hidden = !coordinator || memory;
+          // From memory the link goes back to the threads; from a worker, to its coordinator.
+          $("back").hidden = !coordinator || (!memory && data.isCoordinator);
+          $("back-label").textContent = memory ? "Overview" : "Coordinator";
+          $("threads").hidden = !coordinator || memory;
+          $("memory").hidden = !memory;
+          if (!coordinator) return;
+          $("partial").hidden = !!data.overview;
+          $("no-threads").hidden = !data.overview || data.overview.groups.length > 0;
+          if (data.overview) renderGroups(data.overview);
+          renderNotes(data.notes);
+        }
+
+        function refresh() {
+          return call("read").then(
+            function (result) {
+              state.data = result.data;
+              render();
+            },
+            function () {},
+          );
+        }
+
+        function showMemory(open) {
+          state.memory = open;
+          if (state.data) render();
+          if (open) $("note").focus();
+        }
+
+        function addNote() {
+          var input = $("note");
+          if (!input.value.trim() || input.disabled) return;
+          // Each call is a new operation, so a second click would save the note twice.
+          input.disabled = $("add").disabled = true;
+          call("remember", { text: input.value })
+            .then(
+              function (result) {
+                input.value = "";
+                state.data.notes = result.data.notes;
+                renderNotes(result.data.notes);
+              },
+              function () {},
+            )
+            .then(function () {
+              input.disabled = $("add").disabled = false;
+              input.focus();
+            });
+        }
+
+        $("open-memory").addEventListener("click", function () {
+          showMemory(true);
+        });
+        $("back").addEventListener("click", function () {
+          if (state.memory) showMemory(false);
+          else if (state.data && state.data.coordinator) reveal(state.data.coordinator.threadId);
+        });
+        $("add").addEventListener("click", addNote);
+        $("note").addEventListener("keydown", function (event) {
+          if (event.key === "Enter" && !event.isComposing) addNote();
+        });
+
+        if (!t3) return notice("Open this panel inside T3 Code.");
+        // Context arrives when the bridge connects and again on theme changes. Each thread gets
+        // its own document, so a refresh per context is all the panel needs.
+        t3.onContext(refresh);
+        if (t3.context) refresh();
+        if (t3.onChanged) t3.onChanged(refresh);
+        // Older hosts send no change signal for views; catch up when the panel comes back into view.
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState === "visible") refresh();
+        });
+      })();
+    </script>
+  </body>
+</html>
