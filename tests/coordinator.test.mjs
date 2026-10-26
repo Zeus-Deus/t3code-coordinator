@@ -89,8 +89,8 @@ NodeTest.test("the coordinator's status leads with what is waiting on the person
   NodeAssert.deepEqual(busy, { label: "12 working · 12 ready for review", tone: "info" });
   NodeAssert.ok(busy.label.length <= 40);
   NodeAssert.equal(coordinatorStatus({ ...idle, ready: many("r", 2) }).tone, "success");
-  NodeAssert.deepEqual(coordinatorStatus(idle), { label: "No threads yet", tone: "neutral" });
-  NodeAssert.equal(coordinatorStatus({ ...idle, done: [{}] }).label, "All threads done");
+  NodeAssert.deepEqual(coordinatorStatus(idle), { label: "No workers yet", tone: "neutral" });
+  NodeAssert.equal(coordinatorStatus({ ...idle, done: [{}] }).label, "All workers done");
   NodeAssert.deepEqual(coordinatorStatus({ ...idle, done: [{}] }, { needsAttention: true }), {
     label: "Waiting on you",
     tone: "warning",

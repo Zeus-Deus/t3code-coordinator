@@ -89,7 +89,7 @@ These need T3 changes, so the plugin doesn't work around them:
   Until then, the coordinator includes memory in each brief.
 - **A question asked in plain text.** T3 only flags a thread as waiting for a pending approval or
   question request, so when the coordinator asks "Shall I merge?" in its reply, the summary still
-  reads **All threads done**.
+  reads **All workers done**.
 - **A cloud runtime** for coordinators that keep working while your machine is off.
 
 ## Development
