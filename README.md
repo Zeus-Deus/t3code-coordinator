@@ -2,54 +2,55 @@
 
 A [T3 Code](https://github.com/pingdotgg/t3code) plugin that gives each project one long-running
 **coordinator** thread. You talk to the coordinator. It scopes the goal, hands the pieces to
-parallel workers through T3's own orchestration tools, reviews what comes back, and assembles it.
-An **Overview** beside the conversation shows which threads are ready for review, waiting on
-you, working or done. Agents share a short project memory.
+parallel threads through T3's own orchestration tools, reviews what comes back, and assembles it.
+A **Projects** tab in the sidebar shows each coordinator with the threads it started nested under
+it. Agents share a short project memory.
 
 The plugin is small on purpose. T3 already runs, isolates, and reports back on delegated work.
-This plugin starts the coordinator, gives it a playbook, recognizes its workers, shows where they
-stand, and keeps the memory. It never starts a worker itself.
+This plugin starts the coordinator, gives it a playbook, places its threads in the sidebar, sums up
+where they stand, and keeps the memory. It never starts a thread itself.
 
 ## Install
 
-The T3 server needs the plugin host with API v1, including live view updates and `view.open`
-beside a given thread.
+The T3 server needs the plugin host with API v1, including native sidebar trees.
 
 1. Open **Settings → Plugins**, choose the environment, and install this directory by its absolute
    path on the server machine (or its Git URL).
 2. Review it, grant the projects you want to coordinate, and approve.
+3. In the sidebar, select the **Projects** tab (the tree button next to Search). T3 remembers the
+   choice on this device. T3's default Activity tab hides delegated threads, so the coordinator's
+   threads only show in Projects.
 
 ## Use it
 
 - Run **Open project coordinator** from the command palette or a thread's menu. It opens the
-  project's coordinator, starting one if there is none, with the **Overview** beside it. The
-  coordinator reads the project memory and asks what you want to accomplish.
-- The coordinator hands each piece to a thread with `delegate_task`, in its own worktree. T3 shows
-  each one in the conversation, and its result comes back to the coordinator, which reviews it
-  before accepting.
-- The **Overview** groups those threads by state and updates as they start, stop or wait for you.
-  Select a thread to open it with the Overview still beside it; **Coordinator** at the top of the
-  Overview, or the breadcrumb, takes you back.
-- The thread header shows **Overview** with a short status, such as **Overview · 1 waiting on
-  you**. Select it to open the Overview. It reads **Waiting on you** when the coordinator itself
-  has a pending approval or question.
-- The gear in the Overview opens the **Project memory**. You can add or remove notes there.
+  project's coordinator, starting one if there is none. The coordinator reads the project memory
+  and asks what you want to accomplish.
+- The coordinator hands each piece to a thread with `delegate_task`, in its own worktree. Each one
+  appears in the **Projects** tab nested under the coordinator, in the order it was started, with
+  T3's own status on its row: working, waiting on you, finished. Its result comes back to the
+  coordinator, which reviews it and settles it once accepted.
+- The coordinator's header shows **Project** with a short summary, such as **Project · 2 working ·
+  1 ready for review**. It reads **Waiting on you** first when anything, the coordinator included,
+  has a pending approval or question. Select it to open the **Project** panel, where you can add
+  or remove memory notes.
 
-T3's sidebar is unchanged: the coordinator is one row in its project, and the threads it delegates
-stay out of the Activity list.
+The tab lists every granted project: its coordinator first, then the project's other live threads
+by recent activity. Settled and snoozed top-level threads stay on T3's shelves, as in Activity; a
+parked fork or sub-thread still follows its parent row. Finished workers stay in place until more
+than five of them would bury the rest; the oldest then fold into one collapsed **Done** group just
+below the coordinator.
 
 To retire a coordinator, archive its thread. The next **Open project coordinator** starts a new one.
 
-### What the states mean
+### What the summary counts
 
 | State            | Meaning                                                             |
 | ---------------- | ------------------------------------------------------------------- |
-| Ready for review | Finished and not settled: the coordinator hasn't accepted it yet    |
 | Waiting on you   | A pending approval or question, or a failed run                     |
 | Working          | A run is in progress                                                |
+| Ready for review | Finished and not settled: the coordinator hasn't accepted it yet    |
 | Done             | Settled, by the coordinator after review or by T3 (merged PR, idle) |
-
-Threads keep the order they were started in, so a row never jumps when another changes state.
 
 A thread counts when it is a `delegate_task` child of the coordinator, or one the coordinator
 started with `t3_thread_launch` or `create_threads`. A thread's own sub-agents are its business.
@@ -81,13 +82,13 @@ conversation. The run-finalized event can't tell who started a run.
 
 These need T3 changes, so the plugin doesn't work around them:
 
-- **A thread's transcript inside the Overview.** T3's right panel has no thread surface, so a
-  thread opens in the main view with the Overview beside it.
+- **Switching to the Projects tab for you.** No plugin intent selects a sidebar tab, so you pick
+  it once.
 - **Workers in other environments.** Waits on T3's linked-environment MCP work.
 - **Memory in every run automatically.** Needs a host hook that adds context before a run starts.
   Until then, the coordinator includes memory in each brief.
 - **A question asked in plain text.** T3 only flags a thread as waiting for a pending approval or
-  question request, so when the coordinator asks "Shall I merge?" in its reply, the Overview still
+  question request, so when the coordinator asks "Shall I merge?" in its reply, the summary still
   reads **All threads done**.
 - **A cloud runtime** for coordinators that keep working while your machine is off.
 
@@ -98,7 +99,8 @@ node --test tests/
 ```
 
 The tests run the plugin against a fake host that keeps the real host's rules: deleted threads
-read as denied, pages cap at 200, and an invocation gets at most 100 host calls.
+read as denied, pages cap at 200, and an invocation gets at most 100 host calls. A tree read
+stays within 80.
 
 ## License
 

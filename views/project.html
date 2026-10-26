@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Project</title>
+    <style>
+      /* T3 applies its theme variables to <html>; the fallbacks cover the first paint. */
+      :root {
+        --bg: var(--color-background-primary, #ffffff);
+        --muted-bg: var(--color-background-tertiary, #f1f1f3);
+        --fg: var(--color-text-primary, #111113);
+        --muted: var(--color-text-secondary, #6b6b74);
+        --border: var(--color-border-primary, #e6e6e9);
+        --input: var(--color-border-secondary, #d6d6da);
+        --ring: var(--color-ring-primary, #6b6bff);
+        --danger: var(--color-text-danger, #b42318);
+        --radius: var(--border-radius-md, 8px);
+        --font: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+        color-scheme: light dark;
+      }
+      html[data-t3-theme="dark"] {
+        --bg: var(--color-background-primary, #0b0b0c);
+        --muted-bg: var(--color-background-tertiary, #1c1c1f);
+        --fg: var(--color-text-primary, #ededef);
+        --muted: var(--color-text-secondary, #a1a1aa);
+        --border: var(--color-border-primary, #26262b);
+        --input: var(--color-border-secondary, #34343a);
+        --danger: var(--color-text-danger, #f87171);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      html,
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px/1.45 var(--font);
+      }
+      main {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding: 14px 12px 24px;
+      }
+      p {
+        margin: 0;
+      }
+      button,
+      input {
+        font: inherit;
+        color: inherit;
+      }
+      button {
+        border: 0;
+        background: none;
+        padding: 0;
+        cursor: pointer;
+      }
+      button:focus-visible,
+      input:focus-visible {
+        outline: 2px solid var(--ring);
+        outline-offset: 1px;
+      }
+      svg {
+        flex: none;
+        width: 14px;
+        height: 14px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 0 0 0 4px;
+      }
+      .name {
+        font-size: 14px;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .muted {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .titles {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .label {
+        padding: 0 4px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 500;
+      }
+      section {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .hint {
+        padding: 0 4px 4px;
+      }
+      .empty {
+        padding: 2px 4px 6px;
+      }
+      .notes {
+        display: flex;
+        flex-direction: column;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      .notes li {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        padding: 7px 4px;
+        border-radius: calc(var(--radius) - 2px);
+      }
+      .notes li:hover {
+        background: var(--muted-bg);
+      }
+      .notes p {
+        flex: 1;
+        min-width: 0;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      /* Hidden until hover, but still reachable by keyboard; always shown on touch screens. */
+      .notes button {
+        color: var(--muted);
+        opacity: 0;
+      }
+      .notes li:hover button,
+      .notes button:focus-visible {
+        opacity: 1;
+      }
+      @media (pointer: coarse) {
+        .notes button {
+          opacity: 1;
+        }
+      }
+      .add {
+        display: flex;
+        gap: 6px;
+      }
+      .add input {
+        flex: 1;
+        min-width: 0;
+        height: 30px;
+        padding: 0 10px;
+        border: 1px solid var(--input);
+        border-radius: calc(var(--radius) - 2px);
+        background: var(--bg);
+      }
+      .add button {
+        height: 30px;
+        padding: 0 12px;
+        border: 1px solid var(--input);
+        border-radius: calc(var(--radius) - 2px);
+        font-size: 12px;
+        font-weight: 500;
+      }
+      .add button:hover:not(:disabled) {
+        background: var(--muted-bg);
+      }
+      .notice {
+        color: var(--danger);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+      .notice:empty {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header class="head">
+        <div class="titles">
+          <span class="name" id="name">Project</span>
+          <span class="muted" id="summary"></span>
+        </div>
+      </header>
+
+      <section id="memory">
+        <p class="label">Memory</p>
+        <p class="muted hint">
+          Decisions and conventions the coordinator keeps, and passes on to the threads it starts.
+        </p>
+        <ul class="notes" id="notes"></ul>
+        <p class="muted empty" id="empty" hidden>No notes yet.</p>
+        <div class="add">
+          <input id="note" maxlength="1000" placeholder="Add a note" autocomplete="off" />
+          <button type="button" id="add">Add</button>
+        </div>
+      </section>
+
+      <p class="notice" id="notice" role="status"></p>
+    </main>
+    <script>
+      (function () {
+        "use strict";
+        var t3 = window.t3;
+        var $ = function (id) {
+          return document.getElementById(id);
+        };
+        var REMOVE = '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>';
+        var state = { data: null };
+
+        function el(tag, className, text) {
+          var node = document.createElement(tag);
+          if (className) node.className = className;
+          if (text !== undefined) node.textContent = text;
+          return node;
+        }
+
+        function notice(error) {
+          $("notice").textContent = error ? String(error.message || error) : "";
+        }
+
+        function call(name, input) {
+          notice(null);
+          if (!t3) return Promise.reject(new Error("Open this panel inside T3 Code."));
+          return t3.invoke(name, input).catch(function (error) {
+            notice(error);
+            throw error;
+          });
+        }
+
+        function renderNotes(notes) {
+          var list = $("notes");
+          list.replaceChildren();
+          $("empty").hidden = notes.length > 0;
+          notes.forEach(function (note) {
+            var remove = el("button");
+            remove.type = "button";
+            remove.setAttribute("aria-label", "Remove note");
+            var icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            icon.setAttribute("viewBox", "0 0 24 24");
+            icon.setAttribute("aria-hidden", "true");
+            icon.innerHTML = REMOVE;
+            remove.append(icon);
+            remove.addEventListener("click", function () {
+              remove.disabled = true;
+              call("forget", { id: note.id }).then(
+                function (result) {
+                  state.data.notes = result.data.notes;
+                  renderNotes(result.data.notes);
+                },
+                function () {
+                  remove.disabled = false;
+                },
+              );
+            });
+            var item = el("li");
+            item.append(el("p", "", note.text), remove);
+            list.append(item);
+          });
+        }
+
+        function render() {
+          var data = state.data;
+          $("name").textContent = data.project || "Project";
+          $("summary").textContent = data.summary || "";
+          renderNotes(data.notes);
+        }
+
+        function refresh() {
+          return call("read").then(
+            function (result) {
+              // Signals arrive in bursts; redrawing identical rows would swallow a click mid-press.
+              if (JSON.stringify(result.data) === JSON.stringify(state.data)) return;
+              state.data = result.data;
+              render();
+            },
+            function () {},
+          );
+        }
+
+        function addNote() {
+          var input = $("note");
+          if (!input.value.trim() || input.disabled) return;
+          // Each call is a new operation, so a second click would save the note twice.
+          input.disabled = $("add").disabled = true;
+          call("remember", { text: input.value })
+            .then(
+              function (result) {
+                input.value = "";
+                state.data.notes = result.data.notes;
+                renderNotes(result.data.notes);
+              },
+              function () {},
+            )
+            .then(function () {
+              input.disabled = $("add").disabled = false;
+              input.focus();
+            });
+        }
+
+        $("add").addEventListener("click", addNote);
+        $("note").addEventListener("keydown", function (event) {
+          if (event.key === "Enter" && !event.isComposing) addNote();
+        });
+
+        if (!t3) return notice("Open this panel inside T3 Code.");
+        // Context arrives when the bridge connects and again on theme changes. Each thread gets
+        // its own document, so a refresh per context is all the panel needs.
+        t3.onContext(refresh);
+        if (t3.context) refresh();
+        if (t3.onChanged) t3.onChanged(refresh);
+        // Older hosts send no change signal for views; catch up when the panel comes back into view.
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState === "visible") refresh();
+        });
+      })();
+    </script>
+  </body>
+</html>

@@ -3,13 +3,16 @@ import * as NodeTest from "node:test";
 import {
   appendNote,
   BRIEF,
+  buildTree,
   coordinatorStatus,
   decodeCoordinators,
   GUIDE,
   groupWorkers,
   isWorker,
   MEMORY_LIMITS,
-  overview,
+  projectSection,
+  projectStatus,
+  TREE_LIMITS,
   workerState,
 } from "../lib/coordinator.mjs";
 
@@ -94,25 +97,87 @@ NodeTest.test("the coordinator's status leads with what is waiting on the person
   });
 });
 
-NodeTest.test("the overview lists only groups with threads, in the order a person acts on", () => {
-  const view = overview(
+NodeTest.test("the project status sums up the coordinator's own workers", () => {
+  const status = projectStatus(
     [
       thread("c"),
-      delegated("done", "c", { settledAt: "2026-10-01" }),
       delegated("run", "c", { isRunning: true }),
       delegated("ask", "c", { needsAttention: true }),
+      delegated("other", "x", { isRunning: true }),
     ],
     "c",
   );
-  NodeAssert.deepEqual(
-    view.groups.map((g) => [g.title, g.threads.map((t) => t.threadId)]),
-    [
-      ["Waiting on you", ["ask"]],
-      ["Working", ["run"]],
-      ["Done", ["done"]],
-    ],
+  NodeAssert.deepEqual(status, { label: "1 waiting on you", tone: "warning" });
+});
+
+NodeTest.test("finished workers stay in place until they would bury the rest", () => {
+  const workers = Array.from({ length: TREE_LIMITS.inlineDone + 2 }, (_, i) =>
+    delegated(`w${i}`, "c", {
+      createdAt: `2026-10-25T0${i}:00:00Z`,
+      settledAt: i === 3 ? null : "2026-10-25T10:00:00Z",
+    }),
   );
-  NodeAssert.equal(view.status.label, "1 waiting on you");
+  const section = projectSection("p", [thread("c"), ...workers], "c");
+  // Six settled: the oldest one folds into Done; the rest keep their start order with the open one.
+  NodeAssert.deepEqual(
+    section.done.map((t) => t.id),
+    ["w0"],
+  );
+  NodeAssert.deepEqual(
+    section.workers.map((t) => t.id),
+    ["w1", "w2", "w3", "w4", "w5", "w6"],
+  );
+  const { nodes } = buildTree([section]);
+  const done = nodes.find((node) => node.kind === "group");
+  NodeAssert.deepEqual(
+    { title: done.title, collapsedByDefault: done.collapsedByDefault },
+    { title: "Done", collapsedByDefault: true },
+  );
+  NodeAssert.equal(done.parentId, nodes.find((node) => node.threadId === "c").id);
+  NodeAssert.equal(nodes.find((node) => node.threadId === "w0").parentId, done.id);
+});
+
+NodeTest.test("a finished worker still waiting on the person never folds into Done", () => {
+  const settled = { settledAt: "2026-10-25T10:00:00Z" };
+  const workers = Array.from({ length: TREE_LIMITS.inlineDone + 1 }, (_, i) =>
+    delegated(`w${i}`, "c", { createdAt: `2026-10-25T0${i}:00:00Z`, ...settled }),
+  );
+  workers[0].needsAttention = true;
+  const section = projectSection("p", [thread("c"), ...workers], "c");
+  NodeAssert.deepEqual(section.done, []);
+});
+
+NodeTest.test("a coordinator too large to place leaves its whole branch to T3", () => {
+  const workers = Array.from({ length: TREE_LIMITS.nodes + 10 }, (_, i) =>
+    delegated(`w${i}`, "c", { settledAt: "2026-10-25T10:00:00Z" }),
+  );
+  const { nodes } = buildTree([projectSection("p", [thread("c"), ...workers], "c")]);
+  // Placing the coordinator without its Done group would pull every omitted worker under it.
+  NodeAssert.deepEqual(
+    nodes.map((node) => node.kind),
+    ["project"],
+  );
+});
+
+NodeTest.test("other threads join their project only while they are live and top level", () => {
+  const section = projectSection(
+    "p",
+    [
+      thread("old", { updatedAt: "2026-10-01T00:00:00Z" }),
+      thread("new", { updatedAt: "2026-10-24T00:00:00Z" }),
+      thread("settled", { settledAt: "2026-10-02T00:00:00Z" }),
+      thread("snoozed", { snoozedUntil: "2026-10-30T00:00:00Z" }),
+      thread("gone", { archivedAt: "2026-10-02T00:00:00Z" }),
+      thread("fork", { lineage: { parentThreadId: "old", relationshipToParent: "fork" } }),
+    ],
+    undefined,
+    Date.parse("2026-10-25T00:00:00Z"),
+  );
+  NodeAssert.equal(section.coordinator, null);
+  NodeAssert.deepEqual(
+    section.others.map((t) => t.id),
+    ["new", "old"],
+  );
 });
 
 NodeTest.test("memory refuses to grow past its budget instead of dropping old decisions", () => {
@@ -131,7 +196,7 @@ NodeTest.test("stored data from an unknown version is refused, not overwritten",
 
 NodeTest.test("the first message stays short and hands off to the guide", () => {
   NodeAssert.ok(BRIEF.length <= 120, `${BRIEF.length} characters`);
-  NodeAssert.match(BRIEF, /guide action/);
+  NodeAssert.match(BRIEF, /coordinator guide/);
   for (const tool of ["delegate_task", "memory-read", "memory-append", "t3_thread_organize"])
     NodeAssert.ok(GUIDE.includes(tool), tool);
   NodeAssert.match(GUIDE, /ask what this project should accomplish/);
