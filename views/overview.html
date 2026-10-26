@@ -484,6 +484,8 @@
         function refresh() {
           return call("read").then(
             function (result) {
+              // Signals arrive in bursts; redrawing identical rows would swallow a click mid-press.
+              if (JSON.stringify(result.data) === JSON.stringify(state.data)) return;
               state.data = result.data;
               render();
             },
