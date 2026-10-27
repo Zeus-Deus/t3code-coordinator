@@ -14,7 +14,10 @@
     "ui.native-trees",
     "ui.changes"
   ],
-  "optionalCapabilities": ["ui.native-tree-conversations"],
+  "optionalCapabilities": [
+    "ui.native-tree-conversations",
+    "ui.native-tree-projects"
+  ],
   "actions": [
     {
       "id": "coordinator",
@@ -26,6 +29,12 @@
       "id": "open-conversation",
       "title": "Open project conversation",
       "description": "Open this project's conversation from the Projects tab, starting it the first time.",
+      "placements": []
+    },
+    {
+      "id": "new-project",
+      "title": "New project",
+      "description": "Start a project's conversation, or bring back its archived one, from the top of the Projects tab.",
       "placements": []
     },
     {
@@ -70,7 +79,13 @@
     {
       "id": "projects",
       "title": "Projects",
-      "description": "Each project opens its conversation, with the threads it started nested under it."
+      "description": "Projects you talk to: each one is a conversation, with the threads it started nested under it.",
+      "unplaced": "omit",
+      "create": {
+        "actionId": "new-project",
+        "title": "New project"
+      },
+      "emptyText": "Each project here is one conversation that plans the work and hands it to threads nested under it."
     }
   ],
   "settings": []

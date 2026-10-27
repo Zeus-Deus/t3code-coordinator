@@ -374,3 +374,34 @@ NodeTest.test(
     );
   },
 );
+
+NodeTest.test(
+  "as its own view, the tree lists only projects with a conversation, latest activity first",
+  () => {
+    const project = (id, coordinatorId, updatedAt) =>
+      projectSection(
+        id,
+        coordinatorId
+          ? [
+              thread(coordinatorId, { projectId: id, updatedAt }),
+              thread(`${id}-other`, { projectId: id, updatedAt }),
+            ]
+          : [thread(`${id}-other`, { projectId: id, updatedAt })],
+        coordinatorId,
+      );
+    const { nodes } = buildTree(
+      [
+        project("old", "c-old", "2026-10-01T00:00:00Z"),
+        project("none", undefined, "2026-10-26T00:00:00Z"),
+        project("new", "c-new", "2026-10-25T00:00:00Z"),
+      ],
+      { openAction: "open", coordinatorsOnly: true },
+    );
+    NodeAssert.deepEqual(
+      nodes.filter((n) => n.kind === "project").map((n) => n.projectId),
+      ["new", "old"],
+    );
+    // Other threads stay in Activity.
+    NodeAssert.ok(!nodes.some((n) => n.threadId?.endsWith("-other")));
+  },
+);

@@ -15,18 +15,24 @@ where they stand, and keeps the memory. It never starts a thread itself.
 The T3 server needs the plugin host with API v1, including native sidebar trees. The project as
 the conversation needs a host with conversation headings (`ui.native-tree-conversations`), which
 also lets the conversation start empty, with the coordinator's brief travelling with your first
-message. On older hosts the coordinator is a row under the project, started from the command
-palette with a short kickoff message.
+message. With project trees (`ui.native-tree-projects`) the **Projects** tab becomes its own view,
+like Claude Code Projects: it lists only projects you've started a conversation in, and those
+conversations leave T3's Activity list. On older hosts the coordinator is a row under the project,
+started from the command palette with a short kickoff message.
 
 1. Open **Settings → Plugins**, choose the environment, and install this directory by its absolute
    path on the server machine (or its Git URL).
 2. Review it, grant the projects you want to coordinate, and approve.
 3. In the sidebar, select the **Projects** tab (the tree button next to Search). T3 remembers the
-   choice on this device. T3's default Activity tab hides delegated threads, so the coordinator's
-   threads only show in Projects.
+   choice on this device. Activity stays T3's inbox for everything else: it hides delegated
+   threads, and with project trees the conversations too. Disable or remove the plugin and the
+   conversations return to Activity; search and the command palette always find them.
 
 ## Use it
 
+- **New project** at the top of the **Projects** tab opens T3's project picker: choose a project
+  or add a folder. If the plugin hasn't been granted that project, T3 asks once. Its
+  conversation then opens; an empty tab shows just the button and one line.
 - In the **Projects** tab, click a project's name to open its conversation. The first time, it
   opens empty with the **Overview** beside it, asking what to build; nothing runs until you write.
   **View** above the composer shows the brief the plugin adds to your first message, and the sent
@@ -45,13 +51,17 @@ palette with a short kickoff message.
   state, which open with the Overview still beside them, and the project memory, where you can add
   or remove notes.
 
-The tab lists every granted project: the coordinator's threads, then the project's other live
-threads by recent activity. Settled and snoozed top-level threads stay on T3's shelves, as in Activity; a
-parked fork or sub-thread still follows its parent row. Finished workers stay in place until more
+With project trees the tab lists projects that have a conversation, most recently active first,
+and nothing else; other threads stay in Activity. On older hosts it lists every granted project,
+with its other live threads after the coordinator's. Finished workers stay in place until more
 than five of them would bury the rest; the oldest then fold into one collapsed **Done** group
 under the project.
 
-To retire a conversation, archive its thread. The next click on the project starts a new one.
+**Removing a project** from the tab is T3's own archive of its conversation (the project row's
+thread menu). History and project memory are kept. **New project** on the same project, or
+unarchiving the thread, brings back that same conversation; a new one starts only if the old one
+was deleted. If the plugin can't tell what happened to it, it stops and says so instead of
+starting a second one.
 
 ### What the Overview groups
 
@@ -92,9 +102,10 @@ conversation. The run-finalized event can't tell who started a run.
 
 These need T3 changes, so the plugin doesn't work around them:
 
-- **The first frame after the first click.** For up to half a second the new conversation shows
-  under T3's "Other threads", with a doubled "Shelf / Shelf" breadcrumb, until the tree
-  refreshes; T3 deliberately never hides an unplaced thread on a timer.
+- **The breadcrumb outside the Projects tab.** Opened from Activity or search, a conversation's
+  header reads "Shelf / Shelf", since only the Projects tab knows the row is the project.
+- **Workers in search.** T3's search and palette leave out every delegated thread, so a worker is
+  reached through its project or the conversation's subagent cards.
 - **Switching to the Projects tab for you.** No plugin intent selects a sidebar tab, so you pick
   it once.
 - **A thread's transcript inside the Overview.** T3's right panel has no thread surface, so a

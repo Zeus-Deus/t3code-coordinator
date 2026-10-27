@@ -28,6 +28,18 @@ const VIEW = "overview";
 const TOPICS = [`tree:${TREE}`, `view:${VIEW}`, `status:${VIEW}`];
 // Optional: project headings that are a thread, and threads created empty with a brief.
 const CONVERSATIONS = "ui.native-tree-conversations";
+// Optional: the Projects tab as its own view, owning its conversations, which leave Activity.
+const PROJECTS = "ui.native-tree-projects";
+const OWNER = `tree:${TREE}`;
+// Opening never guesses: these cases leave the choice to the person.
+const PROBLEMS = {
+  unknown:
+    "Couldn't check this project's conversation, so nothing was started. Try again.",
+  ambiguous:
+    "This project has more than one conversation. Open the one you want from Settings → Archive.",
+  archived:
+    "This project's conversation is archived. Restore it from Settings → Archive.",
+};
 
 export function activate(ctx) {
   let queue = Promise.resolve();
@@ -115,11 +127,93 @@ export function activate(ctx) {
   };
 
   const conversations = () => ctx.capabilities?.includes(CONVERSATIONS);
+  const projectsView = () =>
+    conversations() && ctx.capabilities?.includes(PROJECTS);
+
+  const isConversation = (thread) =>
+    thread.pluginOwner?.treeId === TREE && !thread.lineage?.parentThreadId;
+
+  /**
+   * Where a project's conversation stands. Only a conversation that is provably gone may be
+   * replaced: a failed or denied lookup is "unknown", so a second conversation never appears
+   * behind the person's back.
+   */
+  const resolveCoordinator = async (projectId, invocation) => {
+    const stored = (await readCoordinators()).projects[projectId];
+    if (stored) {
+      try {
+        const thread = await ctx.threads.metadata({
+          threadId: stored.threadId,
+        });
+        if (thread.projectId !== projectId) return { state: "unknown" };
+        return { state: thread.archivedAt ? "archived" : "live", thread };
+      } catch (error) {
+        if (error?.reason !== "permission_denied") return { state: "unknown" };
+      }
+    }
+    // A denial may be a deleted thread or lost access; listing the project tells them apart, and
+    // also finds a conversation created just before its id could be stored.
+    let scan;
+    try {
+      scan = await listThreads(projectId, invocation, { calls: SCAN_PAGES });
+    } catch {
+      return { state: "unknown" };
+    }
+    if (!scan.complete) return { state: "unknown" };
+    if (stored && scan.threads.some((t) => t.id === stored.threadId))
+      return { state: "unknown" };
+    const owned = projectsView() ? scan.threads.filter(isConversation) : [];
+    if (owned.length > 1) return { state: "ambiguous" };
+    if (owned.length === 1)
+      return {
+        state: owned[0].archivedAt ? "archived" : "live",
+        thread: owned[0],
+      };
+    return { state: stored ? "deleted" : "none" };
+  };
+
+  const remember = async (projectId, threadId) => {
+    const store = await readCoordinators();
+    if (store.projects[projectId]?.threadId === threadId) return true;
+    store.projects[projectId] = {
+      threadId,
+      createdAt: new Date().toISOString(),
+    };
+    await ctx.storage.set(COORDINATORS, store);
+    return false;
+  };
+
+  /** Brings a conversation created before the Projects view owned them into it. Idempotent. */
+  const adopt = async (thread) => {
+    if (!projectsView() || thread.pluginOwner) return;
+    try {
+      await ctx.threads.adopt({ threadId: thread.id, owner: OWNER });
+    } catch (error) {
+      // It stays in Activity until a later open succeeds; nothing becomes unreachable.
+      ctx.log(
+        "warn",
+        `Could not move a conversation into Projects: ${error?.message}`,
+      );
+    }
+  };
 
   const openCoordinator = (projectId, invocation) =>
     serial(async () => {
-      const existing = await liveCoordinator(projectId);
-      if (existing) return { threadId: existing.id, created: false };
+      const found = await resolveCoordinator(projectId, invocation);
+      if (found.state === "unknown" || found.state === "ambiguous")
+        return { problem: found.state };
+      if (found.state === "archived" && !projectsView())
+        return { problem: "archived" };
+      if (found.state === "live" || found.state === "archived") {
+        const { thread } = found;
+        // Re-adding a project brings back the same conversation, with its history and memory.
+        if (found.state === "archived")
+          await ctx.threads.unarchive({ threadId: thread.id });
+        await adopt(thread);
+        const known = await remember(projectId, thread.id);
+        if (found.state === "archived" || !known) await invalidate(TOPICS);
+        return { threadId: thread.id, created: false };
+      }
       // A plan-mode source thread would otherwise make the coordinator and its workers plan-only.
       const common = { projectId, interactionMode: "default" };
       const { threadId } = conversations()
@@ -131,6 +225,7 @@ export function activate(ctx) {
               (await listProjects(invocation, { calls: 2 })).get(projectId)
                 ?.title ?? "Project",
             brief: CONVERSATION_BRIEF,
+            ...(projectsView() ? { owner: OWNER } : {}),
             idempotencyKey: "open-conversation",
           })
         : await ctx.threads.create({
@@ -140,12 +235,7 @@ export function activate(ctx) {
             text: BRIEF,
             idempotencyKey: "start-coordinator",
           });
-      const store = await readCoordinators();
-      store.projects[projectId] = {
-        threadId,
-        createdAt: new Date().toISOString(),
-      };
-      await ctx.storage.set(COORDINATORS, store);
+      await remember(projectId, threadId);
       await invalidate(TOPICS);
       return { threadId, created: true };
     });
@@ -173,7 +263,11 @@ export function activate(ctx) {
       context.projectId ??
       (context.threadId ? (await contextThread(invocation)).projectId : null);
     if (!projectId) return { message: "Select a project first." };
-    const { threadId, created } = await openCoordinator(projectId, invocation);
+    const { threadId, created, problem } = await openCoordinator(
+      projectId,
+      invocation,
+    );
+    if (problem) return { message: PROBLEMS[problem] };
     // Like a new project in Claude Code Projects, the Overview is open the first time only.
     return {
       intents: [
@@ -184,9 +278,10 @@ export function activate(ctx) {
     };
   };
   ctx.handle("action:coordinator", coordinatorAction);
-  // The Projects tab's row for a project that has no coordinator yet.
   // A project heading in the Projects tab whose conversation doesn't exist yet.
   ctx.handle("action:open-conversation", coordinatorAction);
+  // "New project" at the top of the Projects tab, after the person picks a project.
+  ctx.handle("action:new-project", coordinatorAction);
 
   ctx.handle("action:guide", () => ({ message: GUIDE }));
 
@@ -296,10 +391,14 @@ export function activate(ctx) {
     ]);
     const now = Date.now();
     const sections = [];
+    const exclusive = projectsView();
+    // As its own view the tab lists only projects with a conversation, so those are the only ones
+    // worth a scan; the host still shows an owned conversation this budget misses.
+    const candidates = [...projects.values()]
+      .filter((project) => !exclusive || store.projects[project.id])
+      .sort((a, b) => a.title.localeCompare(b.title));
     // Only ids this call just listed: one stale reference would make the host reject the tree.
-    for (const project of [...projects.values()].sort((a, b) =>
-      a.title.localeCompare(b.title),
-    )) {
+    for (const project of candidates) {
       if (budget.calls <= 0) break;
       const { threads, complete } = await listThreads(
         project.id,
@@ -322,9 +421,13 @@ export function activate(ctx) {
         break;
       }
     }
+    // Conversations started before the Projects view owned them move out of Activity.
+    for (const section of sections)
+      if (section.coordinator) await adopt(section.coordinator);
     // Hosts without conversation headings would reject the fields, so they go only where granted.
     return buildTree(sections, {
       openAction: conversations() ? "open-conversation" : undefined,
+      coordinatorsOnly: exclusive,
     });
   });
 }

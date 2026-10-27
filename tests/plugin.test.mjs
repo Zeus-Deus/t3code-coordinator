@@ -44,6 +44,7 @@ function host({
     storage: new Map(),
     threads: new Map(threads.map((t) => [t.id, t])),
     created: [],
+    unarchived: [],
     invalidated: [],
     calls: 0,
   };
@@ -92,8 +93,30 @@ function host({
         state.created.push(input);
         state.threads.set(
           threadId,
-          thread(threadId, { projectId: input.projectId }),
+          thread(threadId, {
+            projectId: input.projectId,
+            ...(input.owner
+              ? {
+                  pluginOwner: {
+                    installationId: "self",
+                    treeId: input.owner.slice(5),
+                  },
+                }
+              : {}),
+          }),
         );
+        return { threadId };
+      }),
+      adopt: counted(async ({ threadId, owner }) => {
+        state.threads.get(threadId).pluginOwner = {
+          installationId: "self",
+          treeId: owner.slice(5),
+        };
+        return { threadId };
+      }),
+      unarchive: counted(async ({ threadId }) => {
+        state.unarchived.push(threadId);
+        state.threads.get(threadId).archivedAt = null;
         return { threadId };
       }),
     },
@@ -180,17 +203,20 @@ NodeTest.test(
 );
 
 NodeTest.test(
-  "an archived or deleted coordinator is replaced on the next open",
+  "a deleted coordinator is replaced, but an archived one is never replaced behind your back",
   async () => {
     const h = host({ threads: [thread("here")] });
     await start(h, "here");
     h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
     const read = await h.invoke("status:overview", {}, client("coordinator-1"));
     NodeAssert.equal(read.data, null);
+    // Without the Projects view there is no way to restore it, so the person is told where to.
+    const archived = await start(h, "here");
+    NodeAssert.match(archived.message, /Archive/);
+    NodeAssert.equal(h.state.created.length, 1);
+    h.state.threads.get("coordinator-1").deleted = true;
     await start(h, "here");
-    h.state.threads.get("coordinator-2").deleted = true;
-    await start(h, "here");
-    NodeAssert.equal(h.state.created.length, 3);
+    NodeAssert.equal(h.state.created.length, 2);
   },
 );
 
@@ -492,5 +518,82 @@ NodeTest.test(
       ),
     );
     NodeAssert.equal((await heading(h, "q")).actionId, "open-conversation");
+  },
+);
+
+NodeTest.test(
+  "as its own view, Projects owns its conversations and brings back the same one when re-added",
+  async () => {
+    const projects = [
+      { id: "p", title: "Demo" },
+      { id: "q", title: "Alpha" },
+    ];
+    const capabilities = [
+      "ui.native-tree-conversations",
+      "ui.native-tree-projects",
+    ];
+    const h = host({ projects, threads: [thread("other")], capabilities });
+    const add = (projectId) =>
+      h.invoke(
+        "action:new-project",
+        {},
+        { ...client(), context: { projectId } },
+      );
+    // Empty until a project is added; other threads stay in Activity.
+    NodeAssert.deepEqual((await h.tree()).nodes, []);
+    await add("p");
+    NodeAssert.equal(h.state.created[0].owner, "tree:projects");
+    let { nodes } = await h.tree();
+    NodeAssert.deepEqual(
+      nodes.map((n) => [n.kind, n.projectId ?? n.threadId]),
+      [["project", "p"]],
+    );
+    // Removing is T3's archive; adding the project again restores that thread, not a new one.
+    h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
+    NodeAssert.deepEqual((await h.tree()).nodes, []);
+    const again = await add("p");
+    NodeAssert.deepEqual(h.state.unarchived, ["coordinator-1"]);
+    NodeAssert.equal(h.state.created.length, 1);
+    NodeAssert.deepEqual(again.intents, [
+      { type: "thread.reveal", threadId: "coordinator-1" },
+    ]);
+    // A conversation created just before its id was stored is found, not duplicated.
+    h.state.storage.delete("coordinators.v1");
+    await add("p");
+    NodeAssert.equal(h.state.created.length, 1);
+    // Two candidates: the person chooses; nothing is started.
+    h.state.threads.set(
+      "stray",
+      thread("stray", {
+        projectId: "p",
+        pluginOwner: { installationId: "self", treeId: "projects" },
+      }),
+    );
+    h.state.storage.delete("coordinators.v1");
+    const ambiguous = await add("p");
+    NodeAssert.match(ambiguous.message, /more than one conversation/);
+    NodeAssert.equal(h.state.created.length, 1);
+  },
+);
+
+NodeTest.test(
+  "a conversation from before the Projects view moves into it on the next tree read",
+  async () => {
+    const h = host({ threads: [thread("here")] });
+    await start(h, "here");
+    NodeAssert.equal(
+      h.state.threads.get("coordinator-1").pluginOwner,
+      undefined,
+    );
+    const upgraded = host({
+      threads: [...h.state.threads.values()],
+      capabilities: ["ui.native-tree-conversations", "ui.native-tree-projects"],
+    });
+    upgraded.state.storage = h.state.storage;
+    await upgraded.tree();
+    NodeAssert.equal(
+      upgraded.state.threads.get("coordinator-1").pluginOwner.treeId,
+      "projects",
+    );
   },
 );
