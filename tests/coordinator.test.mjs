@@ -4,6 +4,7 @@ import {
   appendNote,
   BRIEF,
   buildTree,
+  CONVERSATION_BRIEF,
   coordinatorStatus,
   decodeCoordinators,
   GUIDE,
@@ -336,6 +337,40 @@ NodeTest.test(
       "t3_thread_organize",
     ])
       NodeAssert.ok(GUIDE.includes(tool), tool);
-    NodeAssert.match(GUIDE, /ask what this project should accomplish/);
+    NodeAssert.match(GUIDE, /what the project should accomplish/);
+    NodeAssert.ok(CONVERSATION_BRIEF.includes(GUIDE));
+  },
+);
+
+NodeTest.test(
+  "as the project's conversation, the heading carries the coordinator and its workers",
+  () => {
+    const workers = Array.from({ length: TREE_LIMITS.inlineDone + 1 }, (_, i) =>
+      delegated(`w${i}`, "c", {
+        createdAt: `2026-10-25T0${i}:00:00Z`,
+        settledAt: "2026-10-25T10:00:00Z",
+      }),
+    );
+    const section = projectSection("p", [thread("c"), ...workers], "c");
+    const { nodes } = buildTree([section], { openAction: "open" });
+    const heading = nodes.find((node) => node.kind === "project");
+    NodeAssert.equal(heading.threadId, "c");
+    NodeAssert.equal(heading.actionId, undefined);
+    NodeAssert.ok(
+      !nodes.some((node) => node.threadId === "c" && node.kind === "thread"),
+    );
+    const done = nodes.find((node) => node.kind === "group");
+    NodeAssert.equal(done.parentId, heading.id);
+    NodeAssert.equal(
+      nodes.find((node) => node.threadId === "w1").parentId,
+      heading.id,
+    );
+    const { nodes: fresh } = buildTree([projectSection("p", [], undefined)], {
+      openAction: "open",
+    });
+    NodeAssert.deepEqual(
+      { actionId: fresh[0].actionId, threadId: fresh[0].threadId },
+      { actionId: "open", threadId: undefined },
+    );
   },
 );

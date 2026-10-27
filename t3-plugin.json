@@ -1,7 +1,7 @@
 {
   "id": "zeus-deus.coordinator",
   "name": "Project Coordinator",
-  "description": "One long-running coordinator thread per project, one click away in a Projects tab that nests the threads it starts under it with their live status. An Overview beside the coordinator groups those threads by state, and agents share a short project memory.",
+  "description": "Each project in the Projects tab is its own conversation: click the project to talk to its coordinator, and the threads it starts nest under the project with their live status. An Overview beside the conversation groups those threads by state, and agents share a short project memory.",
   "version": "0.1.0",
   "apiVersion": 1,
   "entry": "plugin.mjs",
@@ -14,7 +14,7 @@
     "ui.native-trees",
     "ui.changes"
   ],
-  "optionalCapabilities": ["ui.native-tree-actions"],
+  "optionalCapabilities": ["ui.native-tree-conversations"],
   "actions": [
     {
       "id": "coordinator",
@@ -23,9 +23,9 @@
       "placements": ["palette", "thread-menu"]
     },
     {
-      "id": "start-coordinator",
-      "title": "Start coordinator",
-      "description": "Start this project's coordinator thread from the Projects tab.",
+      "id": "open-conversation",
+      "title": "Open project conversation",
+      "description": "Open this project's conversation from the Projects tab, starting it the first time.",
       "placements": []
     },
     {
@@ -70,7 +70,7 @@
     {
       "id": "projects",
       "title": "Projects",
-      "description": "Each project's coordinator, with the threads it started nested under it."
+      "description": "Each project opens its conversation, with the threads it started nested under it."
     }
   ],
   "settings": []

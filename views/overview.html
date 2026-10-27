@@ -268,13 +268,14 @@
     </style>
   </head>
   <body>
-    <main>
+    <!-- Hidden until the first read, so the panel never flashes an empty project. -->
+    <main id="main" hidden>
       <button type="button" class="back" id="back" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="m12 19-7-7 7-7" />
           <path d="M19 12H5" />
         </svg>
-        Coordinator
+        <span id="back-label">Back to the conversation</span>
       </button>
       <header class="head">
         <span class="name" id="name">Overview</span>
@@ -285,8 +286,8 @@
         <p class="label">Threads</p>
         <div class="groups" id="groups"></div>
         <p class="muted empty" id="no-threads" hidden>
-          Tell the coordinator what to work on. Each piece becomes a thread here
-          and in the sidebar.
+          Say what you want in the conversation. Each piece of work becomes a
+          thread here and under the project in the sidebar.
         </p>
         <p class="muted empty" id="partial" hidden>
           This project has too many threads to group here.
@@ -296,8 +297,8 @@
       <section id="memory">
         <p class="label">Memory</p>
         <p class="muted hint">
-          Decisions and conventions the coordinator keeps, and passes on to the
-          threads it starts.
+          Decisions and conventions this project keeps, and passes on to every
+          thread it starts.
         </p>
         <ul class="notes" id="notes"></ul>
         <p class="muted empty" id="no-notes" hidden>No notes yet.</p>
@@ -459,9 +460,12 @@
             ? data.overview.status.label
             : "";
           $("threads").hidden = !data.coordinator;
-          // From one of its threads, the link goes back to the coordinator's conversation.
+          // From one of its threads, the link goes back to the project's conversation.
           $("back").hidden =
             !data.coordinator || data.coordinator.threadId === data.current;
+          $("back-label").textContent = data.project
+            ? "Back to " + data.project
+            : "Back to the conversation";
           if (data.coordinator) {
             $("partial").hidden = !!data.overview;
             $("no-threads").hidden =
@@ -480,8 +484,11 @@
                 return;
               state.data = result.data;
               render();
+              $("main").hidden = false;
             },
-            function () {},
+            function () {
+              $("main").hidden = false;
+            },
           );
         }
 

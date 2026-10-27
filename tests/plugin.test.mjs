@@ -443,7 +443,7 @@ NodeTest.test(
 );
 
 NodeTest.test(
-  "a project without a coordinator offers it on its heading, where the host can",
+  "where the host can, the project heading is the conversation, started empty on first click",
   async () => {
     const projects = [
       { id: "p", title: "Demo" },
@@ -454,21 +454,43 @@ NodeTest.test(
         (node) => node.kind === "project" && node.projectId === projectId,
       );
     const plain = host({ projects, threads: [thread("here")] });
-    NodeAssert.equal((await heading(plain, "p")).actionId, undefined);
+    const legacy = await heading(plain, "p");
+    NodeAssert.equal(legacy.actionId, undefined);
+    NodeAssert.equal(legacy.threadId, undefined);
     const h = host({
       projects,
       threads: [thread("here")],
-      capabilities: ["ui.native-tree-actions"],
+      capabilities: ["ui.native-tree-conversations"],
     });
-    NodeAssert.equal((await heading(h, "p")).actionId, "start-coordinator");
-    // Reading the tree starts nothing; the click does, and then the coordinator's row takes over.
+    NodeAssert.equal((await heading(h, "p")).actionId, "open-conversation");
+    // Reading the tree starts nothing; the click does.
     NodeAssert.equal(h.state.created.length, 0);
-    await h.invoke(
-      "action:start-coordinator",
+    const opened = await h.invoke(
+      "action:open-conversation",
       {},
       { ...client(), context: { projectId: "p" } },
     );
-    NodeAssert.equal((await heading(h, "p")).actionId, undefined);
-    NodeAssert.equal((await heading(h, "q")).actionId, "start-coordinator");
+    NodeAssert.deepEqual(opened.intents, [
+      { type: "view.open", viewId: "overview", threadId: "coordinator-1" },
+    ]);
+    // Named after the project, with no first message: the brief waits for the person's own.
+    const [request] = h.state.created;
+    NodeAssert.equal(request.title, "Demo");
+    NodeAssert.equal(request.text, undefined);
+    NodeAssert.match(request.brief, /delegate_task/);
+    NodeAssert.ok(request.brief.length <= 4000);
+    const { nodes } = await h.tree();
+    const p = nodes.find((node) => node.projectId === "p");
+    NodeAssert.deepEqual(
+      { threadId: p.threadId, actionId: p.actionId },
+      { threadId: "coordinator-1", actionId: undefined },
+    );
+    // The conversation is the heading, never a row of its own.
+    NodeAssert.ok(
+      !nodes.some(
+        (node) => node.threadId === "coordinator-1" && node.kind === "thread",
+      ),
+    );
+    NodeAssert.equal((await heading(h, "q")).actionId, "open-conversation");
   },
 );

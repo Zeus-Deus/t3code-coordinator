@@ -1,21 +1,22 @@
 # Project Coordinator for T3 Code
 
-A [T3 Code](https://github.com/pingdotgg/t3code) plugin that gives each project one long-running
-**coordinator** thread. You talk to the coordinator. It scopes the goal, hands the pieces to
-parallel threads through T3's own orchestration tools, reviews what comes back, and assembles it.
-A **Projects** tab in the sidebar puts each project's coordinator one click away, with the threads
-it started nested under it. An **Overview** beside the coordinator groups those threads by state,
-and agents share a short project memory.
+A [T3 Code](https://github.com/pingdotgg/t3code) plugin that makes each project a conversation.
+Click the project in the **Projects** tab and you are talking to its **coordinator**: it scopes the
+goal, hands the pieces to parallel threads through T3's own orchestration tools, reviews what comes
+back, and assembles it. Those threads nest under the project in the sidebar. An **Overview** beside
+the conversation groups them by state, and agents share a short project memory.
 
 The plugin is small on purpose. T3 already runs, isolates, and reports back on delegated work.
-This plugin starts the coordinator, gives it a playbook, places its threads in the sidebar, sums up
+This plugin opens the coordinator, gives it a playbook, places its threads in the sidebar, sums up
 where they stand, and keeps the memory. It never starts a thread itself.
 
 ## Install
 
-The T3 server needs the plugin host with API v1, including native sidebar trees. One-click
-starting from the sidebar needs a host with tree project actions (`ui.native-tree-actions`); on
-older hosts and on mobile, start the coordinator from the command palette instead.
+The T3 server needs the plugin host with API v1, including native sidebar trees. The project as
+the conversation needs a host with conversation headings (`ui.native-tree-conversations`), which
+also lets the conversation start empty, with the coordinator's brief travelling with your first
+message. On older hosts the coordinator is a row under the project, started from the command
+palette with a short kickoff message.
 
 1. Open **Settings → Plugins**, choose the environment, and install this directory by its absolute
    path on the server machine (or its Git URL).
@@ -26,30 +27,31 @@ older hosts and on mobile, start the coordinator from the command palette instea
 
 ## Use it
 
-- In the **Projects** tab, a project without a coordinator shows **Start coordinator** under its
-  name. Click it once: the coordinator starts, opens with the **Overview** beside it, reads the
-  project memory and asks what you want to accomplish. From then on the coordinator's own row sits
-  in that spot, and one click opens it. **Open project coordinator** in the command palette or a
-  thread's menu does the same.
+- In the **Projects** tab, click a project's name to open its conversation. The first time, it
+  opens empty with the **Overview** beside it, asking what to build; nothing runs until you write.
+  **View** above the composer shows the brief the plugin adds to your first message, and the sent
+  message keeps an **Includes Project Coordinator's brief** disclosure. The project row shows the
+  conversation's status and is selected while it is open; its chevron folds the threads.
+  **Open project coordinator** in the command palette or a thread's menu does the same.
 - The coordinator hands each piece to a thread with `delegate_task`, in its own worktree. Each one
   appears under the coordinator's message as T3's subagent card, and in the **Projects** tab nested
-  under the coordinator, in the order it was started, with T3's own status on its row. Its result
+  under the project, in the order it was started, with T3's own status on its row. Its result
   comes back to the coordinator, which reviews it and settles it once accepted. Settle and
   un-settle any thread yourself from its row or menu.
-- The header of the coordinator and of every thread it started shows **Overview** with a short
+- The header of the conversation and of every thread it started shows **Overview** with a short
   summary, such as **Overview · 2 working · 1 ready for review**. It turns to the warning colour
   and leads with **1 waiting on you** when a thread, or the coordinator itself, has a pending
   approval or question or a failed run. Select it to open the **Overview**: the threads grouped by
   state, which open with the Overview still beside them, and the project memory, where you can add
   or remove notes.
 
-The tab lists every granted project: its coordinator first, then the project's other live threads
-by recent activity. Settled and snoozed top-level threads stay on T3's shelves, as in Activity; a
+The tab lists every granted project: the coordinator's threads, then the project's other live
+threads by recent activity. Settled and snoozed top-level threads stay on T3's shelves, as in Activity; a
 parked fork or sub-thread still follows its parent row. Finished workers stay in place until more
-than five of them would bury the rest; the oldest then fold into one collapsed **Done** group just
-below the coordinator.
+than five of them would bury the rest; the oldest then fold into one collapsed **Done** group
+under the project.
 
-To retire a coordinator, archive its thread. The project then offers **Start coordinator** again.
+To retire a conversation, archive its thread. The next click on the project starts a new one.
 
 ### What the Overview groups
 
@@ -74,8 +76,8 @@ to the calling thread's project.
 | `memory-read`   | `{}`       | Returns the project's notes, oldest first                 |
 | `memory-append` | `{ text }` | Adds one note (up to 1,000 characters; 16 KB per project) |
 
-A new coordinator's first message is one line asking it to read the guide. The playbook lives in
-the `guide` action rather than the thread, so a long-running coordinator can reread it after its
+The coordinator's brief carries the whole playbook and travels with your first message. The `guide`
+action returns the same playbook, so a long-running coordinator can reread it after its
 conversation is compacted. The coordinator reads memory before planning and passes the relevant
 notes into each worker's brief, since a delegated worker sees only its brief.
 
@@ -90,6 +92,9 @@ conversation. The run-finalized event can't tell who started a run.
 
 These need T3 changes, so the plugin doesn't work around them:
 
+- **The first frame after the first click.** For up to half a second the new conversation shows
+  under T3's "Other threads", with a doubled "Shelf / Shelf" breadcrumb, until the tree
+  refreshes; T3 deliberately never hides an unplaced thread on a timer.
 - **Switching to the Projects tab for you.** No plugin intent selects a sidebar tab, so you pick
   it once.
 - **A thread's transcript inside the Overview.** T3's right panel has no thread surface, so a

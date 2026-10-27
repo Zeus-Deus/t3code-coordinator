@@ -5,6 +5,7 @@ import {
   appendNote,
   BRIEF,
   buildTree,
+  CONVERSATION_BRIEF,
   decodeCoordinators,
   decodeMemory,
   GUIDE,
@@ -25,6 +26,8 @@ const TREE_BUDGET = 80;
 const TREE = "projects";
 const VIEW = "overview";
 const TOPICS = [`tree:${TREE}`, `view:${VIEW}`, `status:${VIEW}`];
+// Optional: project headings that are a thread, and threads created empty with a brief.
+const CONVERSATIONS = "ui.native-tree-conversations";
 
 export function activate(ctx) {
   let queue = Promise.resolve();
@@ -111,19 +114,32 @@ export function activate(ctx) {
     }
   };
 
+  const conversations = () => ctx.capabilities?.includes(CONVERSATIONS);
+
   const openCoordinator = (projectId, invocation) =>
     serial(async () => {
       const existing = await liveCoordinator(projectId);
       if (existing) return { threadId: existing.id, created: false };
-      const { threadId } = await ctx.threads.create({
-        projectId,
-        // The breadcrumb already names the project: "Shelf / Coordinator".
-        title: "Coordinator",
-        text: BRIEF,
-        // A plan-mode source thread would otherwise make the coordinator and its workers plan-only.
-        interactionMode: "default",
-        idempotencyKey: "start-coordinator",
-      });
+      // A plan-mode source thread would otherwise make the coordinator and its workers plan-only.
+      const common = { projectId, interactionMode: "default" };
+      const { threadId } = conversations()
+        ? // The project heading is this conversation, so it carries the project's name and starts
+          // empty: the brief rides along with the person's first message instead of a run now.
+          await ctx.threads.create({
+            ...common,
+            title:
+              (await listProjects(invocation, { calls: 2 })).get(projectId)
+                ?.title ?? "Project",
+            brief: CONVERSATION_BRIEF,
+            idempotencyKey: "open-conversation",
+          })
+        : await ctx.threads.create({
+            ...common,
+            // The breadcrumb already names the project: "Shelf / Coordinator".
+            title: "Coordinator",
+            text: BRIEF,
+            idempotencyKey: "start-coordinator",
+          });
       const store = await readCoordinators();
       store.projects[projectId] = {
         threadId,
@@ -169,7 +185,8 @@ export function activate(ctx) {
   };
   ctx.handle("action:coordinator", coordinatorAction);
   // The Projects tab's row for a project that has no coordinator yet.
-  ctx.handle("action:start-coordinator", coordinatorAction);
+  // A project heading in the Projects tab whose conversation doesn't exist yet.
+  ctx.handle("action:open-conversation", coordinatorAction);
 
   ctx.handle("action:guide", () => ({ message: GUIDE }));
 
@@ -305,10 +322,9 @@ export function activate(ctx) {
         break;
       }
     }
-    // Hosts without heading actions would reject the field, so it goes only where granted.
-    const startAction = ctx.capabilities?.includes("ui.native-tree-actions")
-      ? "start-coordinator"
-      : undefined;
-    return buildTree(sections, { startAction });
+    // Hosts without conversation headings would reject the fields, so they go only where granted.
+    return buildTree(sections, {
+      openAction: conversations() ? "open-conversation" : undefined,
+    });
   });
 }
