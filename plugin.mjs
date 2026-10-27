@@ -9,10 +9,11 @@ import {
   decodeMemory,
   GUIDE,
   hashId,
+  isWorker,
   memoryKey,
   noteText,
+  overview,
   projectSection,
-  projectStatus,
 } from "./lib/coordinator.mjs";
 
 const COORDINATORS = "coordinators.v1";
@@ -22,7 +23,7 @@ const SCAN_PAGES = 10;
 // Host calls one tree read may spend across every project; the rest stay in Other.
 const TREE_BUDGET = 80;
 const TREE = "projects";
-const VIEW = "project";
+const VIEW = "overview";
 const TOPICS = [`tree:${TREE}`, `view:${VIEW}`, `status:${VIEW}`];
 
 export function activate(ctx) {
@@ -33,8 +34,10 @@ export function activate(ctx) {
     return result;
   };
 
-  const readCoordinators = async () => decodeCoordinators(await ctx.storage.get(COORDINATORS));
-  const readMemory = async (projectId) => decodeMemory(await ctx.storage.get(memoryKey(projectId)));
+  const readCoordinators = async () =>
+    decodeCoordinators(await ctx.storage.get(COORDINATORS));
+  const readMemory = async (projectId) =>
+    decodeMemory(await ctx.storage.get(memoryKey(projectId)));
 
   const listThreads = async (projectId, invocation, budget) => {
     const threads = new Map();
@@ -43,7 +46,8 @@ export function activate(ctx) {
       invocation.signal.throwIfAborted();
       const page = await ctx.threads.list({ projectId, cursor, limit: PAGE });
       for (const thread of page.threads) threads.set(thread.id, thread);
-      if (page.nextCursor === null) return { threads: [...threads.values()], complete: true };
+      if (page.nextCursor === null)
+        return { threads: [...threads.values()], complete: true };
       if (!(page.nextCursor > cursor)) break;
       cursor = page.nextCursor;
     }
@@ -74,7 +78,9 @@ export function activate(ctx) {
   const agentThread = async (invocation) => {
     const { caller } = invocation;
     if (caller.kind !== "agent" || !caller.threadId)
-      throw new Error("Project memory is available to agents running in a T3 thread.");
+      throw new Error(
+        "Project memory is available to agents running in a T3 thread.",
+      );
     return ctx.threads.metadata({ threadId: caller.threadId });
   };
 
@@ -83,7 +89,9 @@ export function activate(ctx) {
     if (!stored) return null;
     try {
       const thread = await ctx.threads.metadata({ threadId: stored.threadId });
-      return thread.projectId === projectId && !thread.archivedAt ? thread : null;
+      return thread.projectId === projectId && !thread.archivedAt
+        ? thread
+        : null;
     } catch (error) {
       // Threads in a granted project are readable, so a denial means the coordinator was deleted.
       // Without the grant, starting a replacement is denied as well.
@@ -96,14 +104,17 @@ export function activate(ctx) {
     try {
       await ctx.ui.invalidate(topics);
     } catch {
-      ctx.log("warn", "Could not notify open views; they refresh on their next read.");
+      ctx.log(
+        "warn",
+        "Could not notify open views; they refresh on their next read.",
+      );
     }
   };
 
   const openCoordinator = (projectId, invocation) =>
     serial(async () => {
       const existing = await liveCoordinator(projectId);
-      if (existing) return existing.id;
+      if (existing) return { threadId: existing.id, created: false };
       const { threadId } = await ctx.threads.create({
         projectId,
         // The breadcrumb already names the project: "Shelf / Coordinator".
@@ -114,10 +125,13 @@ export function activate(ctx) {
         idempotencyKey: "start-coordinator",
       });
       const store = await readCoordinators();
-      store.projects[projectId] = { threadId, createdAt: new Date().toISOString() };
+      store.projects[projectId] = {
+        threadId,
+        createdAt: new Date().toISOString(),
+      };
       await ctx.storage.set(COORDINATORS, store);
       await invalidate(TOPICS);
-      return threadId;
+      return { threadId, created: true };
     });
 
   const addNote = (projectId, note) =>
@@ -128,21 +142,34 @@ export function activate(ctx) {
       } catch (error) {
         throw new Error(
           `Project memory could not be saved (${error?.message ?? "storage failed"}). ` +
-            "Remove notes in the Project panel and retry.",
+            "Remove notes in the Overview and retry.",
         );
       }
       await invalidate([`view:${VIEW}`]);
       return memory;
     });
 
-  ctx.handle("action:coordinator", async (_input, invocation) => {
-    const { threadId, projectId: selected } = invocation.context ?? {};
-    // From the palette a person may have a project selected without any thread open in it.
-    const projectId = threadId ? (await contextThread(invocation)).projectId : selected;
+  const coordinatorAction = async (_input, invocation) => {
+    // A project in context wins: the sidebar names the project its row belongs to, while the
+    // open thread may be in another one. The palette falls back to the open thread's project.
+    const context = invocation.context ?? {};
+    const projectId =
+      context.projectId ??
+      (context.threadId ? (await contextThread(invocation)).projectId : null);
     if (!projectId) return { message: "Select a project first." };
-    const coordinatorId = await openCoordinator(projectId, invocation);
-    return { intents: [{ type: "thread.reveal", threadId: coordinatorId }] };
-  });
+    const { threadId, created } = await openCoordinator(projectId, invocation);
+    // Like a new project in Claude Code Projects, the Overview is open the first time only.
+    return {
+      intents: [
+        created
+          ? { type: "view.open", viewId: VIEW, threadId }
+          : { type: "thread.reveal", threadId },
+      ],
+    };
+  };
+  ctx.handle("action:coordinator", coordinatorAction);
+  // The Projects tab's row for a project that has no coordinator yet.
+  ctx.handle("action:start-coordinator", coordinatorAction);
 
   ctx.handle("action:guide", () => ({ message: GUIDE }));
 
@@ -168,7 +195,10 @@ export function activate(ctx) {
       threadId: thread.id,
       createdAt: new Date().toISOString(),
     });
-    return { message: "Added to project memory.", data: { id, count: notes.length } };
+    return {
+      message: "Added to project memory.",
+      data: { id, count: notes.length },
+    };
   });
 
   ctx.handle(`view:${VIEW}:read`, async (_input, invocation) => {
@@ -184,8 +214,12 @@ export function activate(ctx) {
     return {
       data: {
         project: projects.get(thread.projectId)?.title ?? null,
-        // A partial scan could hide running work, so the panel leaves the summary out.
-        summary: scan?.complete ? projectStatus(scan.threads, coordinator.id).label : null,
+        coordinator: coordinator && { threadId: coordinator.id },
+        current: thread.id,
+        // A partial scan could hide running work, so the panel says so instead of guessing.
+        overview: scan?.complete
+          ? overview(scan.threads, coordinator.id)
+          : null,
         notes,
       },
     };
@@ -206,7 +240,10 @@ export function activate(ctx) {
     const thread = await contextThread(invocation);
     const notes = await serial(async () => {
       const memory = await readMemory(thread.projectId);
-      const next = { ...memory, notes: memory.notes.filter((note) => note.id !== input?.id) };
+      const next = {
+        ...memory,
+        notes: memory.notes.filter((note) => note.id !== input?.id),
+      };
       await ctx.storage.set(memoryKey(thread.projectId), next);
       return next.notes;
     });
@@ -214,15 +251,23 @@ export function activate(ctx) {
     return { data: { notes } };
   });
 
-  // Only the coordinator carries a chip: each worker's own row already shows its state.
+  // Like Claude Code Projects' Overview button, the chip is the same on the coordinator and on
+  // every thread it started, so the Overview is one click away wherever the person is.
   ctx.handle(`status:${VIEW}`, async (_input, invocation) => {
     const thread = await contextThread(invocation);
-    const coordinatorId = (await readCoordinators()).projects[thread.projectId]?.threadId;
-    if (thread.id !== coordinatorId || thread.archivedAt) return { data: null };
-    const scan = await listThreads(thread.projectId, invocation, { calls: SCAN_PAGES });
+    const coordinatorId = (await readCoordinators()).projects[thread.projectId]
+      ?.threadId;
+    if (!coordinatorId || thread.archivedAt) return { data: null };
+    if (thread.id !== coordinatorId && !isWorker(thread, coordinatorId))
+      return { data: null };
+    const scan = await listThreads(thread.projectId, invocation, {
+      calls: SCAN_PAGES,
+    });
+    const coordinator = scan.threads.find((t) => t.id === coordinatorId);
     // Pages follow thread ids, not activity, so a partial count could hide running work.
-    if (!scan.complete) return { data: null };
-    return { data: projectStatus(scan.threads, coordinatorId) };
+    if (!scan.complete || !coordinator || coordinator.archivedAt)
+      return { data: null };
+    return { data: overview(scan.threads, coordinatorId).status };
   });
 
   ctx.trees.register(TREE, async (invocation) => {
@@ -235,15 +280,35 @@ export function activate(ctx) {
     const now = Date.now();
     const sections = [];
     // Only ids this call just listed: one stale reference would make the host reject the tree.
-    for (const project of [...projects.values()].sort((a, b) => a.title.localeCompare(b.title))) {
+    for (const project of [...projects.values()].sort((a, b) =>
+      a.title.localeCompare(b.title),
+    )) {
       if (budget.calls <= 0) break;
-      const { threads, complete } = await listThreads(project.id, invocation, budget);
-      sections.push(projectSection(project.id, threads, store.projects[project.id]?.threadId, now));
+      const { threads, complete } = await listThreads(
+        project.id,
+        invocation,
+        budget,
+      );
+      sections.push(
+        projectSection(
+          project.id,
+          threads,
+          store.projects[project.id]?.threadId,
+          now,
+        ),
+      );
       if (!complete) {
-        ctx.log("debug", "The Projects tree is bounded; remaining threads stay in Other.");
+        ctx.log(
+          "debug",
+          "The Projects tree is bounded; remaining threads stay in Other.",
+        );
         break;
       }
     }
-    return buildTree(sections);
+    // Hosts without heading actions would reject the field, so it goes only where granted.
+    const startAction = ctx.capabilities?.includes("ui.native-tree-actions")
+      ? "start-coordinator"
+      : undefined;
+    return buildTree(sections, { startAction });
   });
 }

@@ -13,13 +13,21 @@ const thread = (id, extra = {}) => ({
   settledOverride: null,
   isRunning: false,
   needsAttention: false,
-  lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: id },
+  lineage: {
+    parentThreadId: null,
+    relationshipToParent: null,
+    rootThreadId: id,
+  },
   ...extra,
 });
 const delegated = (id, parent, extra = {}) =>
   thread(id, {
     creationSource: "mcp",
-    lineage: { parentThreadId: parent, relationshipToParent: "subagent", rootThreadId: parent },
+    lineage: {
+      parentThreadId: parent,
+      relationshipToParent: "subagent",
+      rootThreadId: parent,
+    },
     ...extra,
   });
 
@@ -27,7 +35,11 @@ const delegated = (id, parent, extra = {}) =>
  * A fake host keeping the rules the plugin relies on: a deleted thread reads as permission
  * denied, pages are capped at 200, and every host call counts toward the invocation budget.
  */
-function host({ projects = [{ id: "p", title: "Demo" }], threads = [] } = {}) {
+function host({
+  projects = [{ id: "p", title: "Demo" }],
+  threads = [],
+  capabilities = [],
+} = {}) {
   const state = {
     storage: new Map(),
     threads: new Map(threads.map((t) => [t.id, t])),
@@ -44,18 +56,25 @@ function host({ projects = [{ id: "p", title: "Demo" }], threads = [] } = {}) {
       return fn(...args);
     };
   activate({
-    capabilities: [],
+    capabilities,
     signal: new AbortController().signal,
     storage: {
-      get: counted(async (key) => structuredClone(state.storage.get(key) ?? null)),
-      set: counted(async (key, value) => void state.storage.set(key, structuredClone(value))),
+      get: counted(async (key) =>
+        structuredClone(state.storage.get(key) ?? null),
+      ),
+      set: counted(
+        async (key, value) =>
+          void state.storage.set(key, structuredClone(value)),
+      ),
       delete: counted(async (key) => void state.storage.delete(key)),
     },
     threads: {
       metadata: counted(async ({ threadId }) => {
         const found = state.threads.get(threadId);
         if (!found || found.deleted)
-          throw Object.assign(new Error("Permission denied."), { reason: "permission_denied" });
+          throw Object.assign(new Error("Permission denied."), {
+            reason: "permission_denied",
+          });
         return structuredClone(found);
       }),
       list: counted(async ({ projectId, cursor = 0, limit }) => {
@@ -71,12 +90,17 @@ function host({ projects = [{ id: "p", title: "Demo" }], threads = [] } = {}) {
       create: counted(async (input) => {
         const threadId = `coordinator-${state.created.length + 1}`;
         state.created.push(input);
-        state.threads.set(threadId, thread(threadId, { projectId: input.projectId }));
+        state.threads.set(
+          threadId,
+          thread(threadId, { projectId: input.projectId }),
+        );
         return { threadId };
       }),
     },
     projects: { list: counted(async () => ({ projects, nextCursor: null })) },
-    ui: { invalidate: async (topics) => void state.invalidated.push(...topics) },
+    ui: {
+      invalidate: async (topics) => void state.invalidated.push(...topics),
+    },
     trees: { register: (_id, fn) => (tree = fn) },
     handle: (name, fn) => handlers.set(name, fn),
     log: () => {},
@@ -103,44 +127,72 @@ const agent = (threadId, operationId = `op-${++operation}`) => ({
   caller: { kind: "agent", threadId },
 });
 
-const start = (h, threadId) => h.invoke("action:coordinator", {}, client(threadId));
+const start = (h, threadId) =>
+  h.invoke("action:coordinator", {}, client(threadId));
 
-NodeTest.test("opening twice keeps one coordinator, started in default mode", async () => {
-  const h = host({ threads: [thread("here", { interactionMode: "plan" })] });
-  const first = await start(h, "here");
-  const again = await start(h, "here");
-  NodeAssert.equal(h.state.created.length, 1);
-  const open = [{ type: "thread.reveal", threadId: "coordinator-1" }];
-  NodeAssert.deepEqual(first.intents, open);
-  NodeAssert.deepEqual(again.intents, open);
-  const [request] = h.state.created;
-  NodeAssert.equal(request.title, "Coordinator");
-  NodeAssert.equal(request.interactionMode, "default");
-  NodeAssert.match(request.text, /coordinator guide/);
-  NodeAssert.deepEqual(h.state.invalidated, ["tree:projects", "view:project", "status:project"]);
-});
+NodeTest.test(
+  "opening twice keeps one coordinator, started in default mode",
+  async () => {
+    const h = host({ threads: [thread("here", { interactionMode: "plan" })] });
+    const first = await start(h, "here");
+    const again = await start(h, "here");
+    NodeAssert.equal(h.state.created.length, 1);
+    // The Overview opens beside a new coordinator once; later opens just show the thread.
+    NodeAssert.deepEqual(first.intents, [
+      { type: "view.open", viewId: "overview", threadId: "coordinator-1" },
+    ]);
+    NodeAssert.deepEqual(again.intents, [
+      { type: "thread.reveal", threadId: "coordinator-1" },
+    ]);
+    const [request] = h.state.created;
+    NodeAssert.equal(request.title, "Coordinator");
+    NodeAssert.equal(request.interactionMode, "default");
+    NodeAssert.match(request.text, /coordinator guide/);
+    NodeAssert.deepEqual(h.state.invalidated, [
+      "tree:projects",
+      "view:overview",
+      "status:overview",
+    ]);
+  },
+);
 
-NodeTest.test("a project with no threads yet can start one", async () => {
-  const h = host();
-  const opened = await h.invoke(
-    "action:coordinator",
-    {},
-    { ...client(), context: { projectId: "p" } },
-  );
-  NodeAssert.deepEqual(opened.intents, [{ type: "thread.reveal", threadId: "coordinator-1" }]);
-});
+NodeTest.test(
+  "a project in context wins over the open thread's project",
+  async () => {
+    const h = host({
+      projects: [
+        { id: "p", title: "Demo" },
+        { id: "q", title: "Other" },
+      ],
+      threads: [thread("elsewhere", { projectId: "q" })],
+    });
+    // The sidebar row belongs to project p while a thread in q is open.
+    await h.invoke(
+      "action:coordinator",
+      {},
+      {
+        ...client("elsewhere"),
+        context: { threadId: "elsewhere", projectId: "p" },
+      },
+    );
+    NodeAssert.equal(h.state.created[0].projectId, "p");
+  },
+);
 
-NodeTest.test("an archived or deleted coordinator is replaced on the next open", async () => {
-  const h = host({ threads: [thread("here")] });
-  await start(h, "here");
-  h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
-  const read = await h.invoke("status:project", {}, client("coordinator-1"));
-  NodeAssert.equal(read.data, null);
-  await start(h, "here");
-  h.state.threads.get("coordinator-2").deleted = true;
-  await start(h, "here");
-  NodeAssert.equal(h.state.created.length, 3);
-});
+NodeTest.test(
+  "an archived or deleted coordinator is replaced on the next open",
+  async () => {
+    const h = host({ threads: [thread("here")] });
+    await start(h, "here");
+    h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
+    const read = await h.invoke("status:overview", {}, client("coordinator-1"));
+    NodeAssert.equal(read.data, null);
+    await start(h, "here");
+    h.state.threads.get("coordinator-2").deleted = true;
+    await start(h, "here");
+    NodeAssert.equal(h.state.created.length, 3);
+  },
+);
 
 NodeTest.test("any agent can read the coordinator guide", async () => {
   const h = host({ threads: [thread("worker")] });
@@ -150,7 +202,11 @@ NodeTest.test("any agent can read the coordinator guide", async () => {
 
 NodeTest.test("opening without a project explains itself", async () => {
   const h = host();
-  const result = await h.invoke("action:coordinator", {}, { ...client(), context: {} });
+  const result = await h.invoke(
+    "action:coordinator",
+    {},
+    { ...client(), context: {} },
+  );
   NodeAssert.equal(result.message, "Select a project first.");
   NodeAssert.equal(h.state.created.length, 0);
 });
@@ -165,8 +221,16 @@ NodeTest.test(
       ],
       threads: [thread("worker"), thread("elsewhere", { projectId: "q" })],
     });
-    await h.invoke("action:memory-append", { text: "Use pnpm." }, agent("worker", "retry-me"));
-    await h.invoke("action:memory-append", { text: "Use pnpm." }, agent("worker", "retry-me"));
+    await h.invoke(
+      "action:memory-append",
+      { text: "Use pnpm." },
+      agent("worker", "retry-me"),
+    );
+    await h.invoke(
+      "action:memory-append",
+      { text: "Use pnpm." },
+      agent("worker", "retry-me"),
+    );
     const own = await h.invoke("action:memory-read", {}, agent("worker"));
     NodeAssert.deepEqual(
       own.data.notes.map((n) => [n.text, n.threadId]),
@@ -183,7 +247,11 @@ NodeTest.test(
     );
     NodeAssert.deepEqual(other.data.notes, []);
     await NodeAssert.rejects(
-      h.invoke("action:memory-read", {}, { signal, operationId: "x", caller: { kind: "agent" } }),
+      h.invoke(
+        "action:memory-read",
+        {},
+        { signal, operationId: "x", caller: { kind: "agent" } },
+      ),
       /agents running in a T3 thread/,
     );
   },
@@ -192,10 +260,10 @@ NodeTest.test(
 NodeTest.test("a person can add and remove notes from the panel", async () => {
   const h = host({ threads: [thread("here")] });
   const note = { text: "No new deps." };
-  const added = await h.invoke("view:project:remember", note, client("here"));
+  const added = await h.invoke("view:overview:remember", note, client("here"));
   NodeAssert.equal(added.data.notes.length, 1);
   const removed = await h.invoke(
-    "view:project:forget",
+    "view:overview:forget",
     { id: added.data.notes[0].id },
     client("here"),
   );
@@ -205,104 +273,202 @@ NodeTest.test("a person can add and remove notes from the panel", async () => {
 NodeTest.test("removing a note refreshes other open panels", async () => {
   const h = host({ threads: [thread("here")] });
   const note = { text: "No new deps." };
-  const added = await h.invoke("view:project:remember", note, client("here"));
+  const added = await h.invoke("view:overview:remember", note, client("here"));
   h.state.invalidated.length = 0;
-  await h.invoke("view:project:forget", { id: added.data.notes[0].id }, client("here"));
-  NodeAssert.deepEqual(h.state.invalidated, ["view:project"]);
+  await h.invoke(
+    "view:overview:forget",
+    { id: added.data.notes[0].id },
+    client("here"),
+  );
+  NodeAssert.deepEqual(h.state.invalidated, ["view:overview"]);
 });
 
-NodeTest.test("the panel only calls handlers the bridge accepts and the plugin registers", () => {
-  const html = NodeFs.readFileSync(new URL("../views/project.html", import.meta.url), "utf8");
-  const names = [...html.matchAll(/call\("([^"]+)"/g)].map((match) => match[1]);
-  const h = host();
-  NodeAssert.deepEqual(names.toSorted(), ["forget", "read", "remember"]);
-  for (const name of names) {
-    // The client bridge prefixes `view:<id>:` itself and rejects any other shape.
-    NodeAssert.match(name, /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/);
-    NodeAssert.ok(h.handlers.has(`view:project:${name}`), name);
-  }
-  // The view's sandbox has no allow-forms, so a submit handler would never run.
-  NodeAssert.doesNotMatch(html, /<form/);
-});
+NodeTest.test(
+  "the panel only calls handlers the bridge accepts and the plugin registers",
+  () => {
+    const html = NodeFs.readFileSync(
+      new URL("../views/overview.html", import.meta.url),
+      "utf8",
+    );
+    const names = [...html.matchAll(/call\("([^"]+)"/g)].map(
+      (match) => match[1],
+    );
+    const h = host();
+    NodeAssert.deepEqual(names.toSorted(), ["forget", "read", "remember"]);
+    for (const name of names) {
+      // The client bridge prefixes `view:<id>:` itself and rejects any other shape.
+      NodeAssert.match(name, /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/);
+      NodeAssert.ok(h.handlers.has(`view:overview:${name}`), name);
+    }
+    // The view's sandbox has no allow-forms, so a submit handler would never run.
+    NodeAssert.doesNotMatch(html, /<form/);
+  },
+);
 
-NodeTest.test("only the coordinator carries the status chip", async () => {
-  const h = host({ threads: [thread("here"), thread("bystander")] });
-  await start(h, "here");
-  h.state.threads.set("busy", delegated("busy", "coordinator-1", { isRunning: true }));
-  h.state.threads.set("blocked", delegated("blocked", "coordinator-1", { needsAttention: true }));
-  const status = async (id) => (await h.invoke("status:project", {}, client(id))).data;
-  NodeAssert.deepEqual(await status("coordinator-1"), {
-    label: "1 waiting on you",
-    tone: "warning",
-  });
-  NodeAssert.equal(await status("busy"), null);
-  NodeAssert.equal(await status("bystander"), null);
-  h.state.threads.get("blocked").needsAttention = false;
-  h.state.threads.get("busy").isRunning = false;
-  h.state.threads.get("coordinator-1").needsAttention = true;
-  NodeAssert.equal((await status("coordinator-1")).label, "Waiting on you");
-  h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
-  NodeAssert.equal(await status("coordinator-1"), null);
-});
+NodeTest.test(
+  "the Overview chip sums up the project on the coordinator and its threads",
+  async () => {
+    const h = host({ threads: [thread("here"), thread("bystander")] });
+    await start(h, "here");
+    h.state.threads.set(
+      "busy",
+      delegated("busy", "coordinator-1", { isRunning: true }),
+    );
+    h.state.threads.set(
+      "blocked",
+      delegated("blocked", "coordinator-1", { needsAttention: true }),
+    );
+    const status = async (id) =>
+      (await h.invoke("status:overview", {}, client(id))).data;
+    const waiting = { label: "1 waiting on you", tone: "warning" };
+    NodeAssert.deepEqual(await status("coordinator-1"), waiting);
+    NodeAssert.deepEqual(await status("busy"), waiting);
+    NodeAssert.equal(await status("bystander"), null);
+    // The coordinator's own question counts alongside its threads'.
+    h.state.threads.get("coordinator-1").needsAttention = true;
+    NodeAssert.equal((await status("busy")).label, "2 waiting on you");
+    h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
+    NodeAssert.equal(await status("coordinator-1"), null);
+    NodeAssert.equal(await status("busy"), null);
+  },
+);
 
-NodeTest.test("the coordinator's status stays hidden when its count would be partial", async () => {
-  const h = host({ threads: [thread("here")] });
-  await start(h, "here");
-  for (let i = 0; i < 2_001; i++) h.state.threads.set(`t${i}`, thread(`t${i}`));
-  // Sorts after every filler page, the way a real worker id can.
-  h.state.threads.set("zz", delegated("zz", "coordinator-1", { isRunning: true }));
-  const result = await h.invoke("status:project", {}, client("coordinator-1"));
-  NodeAssert.equal(result.data, null);
-});
+NodeTest.test(
+  "the coordinator's status stays hidden when its count would be partial",
+  async () => {
+    const h = host({ threads: [thread("here")] });
+    await start(h, "here");
+    for (let i = 0; i < 2_001; i++)
+      h.state.threads.set(`t${i}`, thread(`t${i}`));
+    // Sorts after every filler page, the way a real worker id can.
+    h.state.threads.set(
+      "zz",
+      delegated("zz", "coordinator-1", { isRunning: true }),
+    );
+    const result = await h.invoke(
+      "status:overview",
+      {},
+      client("coordinator-1"),
+    );
+    NodeAssert.equal(result.data, null);
+  },
+);
 
-NodeTest.test("the Project panel names the project and sums up the coordinator's threads", async () => {
-  const h = host({ threads: [thread("here")] });
-  await start(h, "here");
-  h.state.threads.set("busy", delegated("busy", "coordinator-1", { isRunning: true }));
-  const { data } = await h.invoke("view:project:read", {}, client("busy"));
-  NodeAssert.deepEqual(data, { project: "Demo", summary: "1 working", notes: [] });
-});
+NodeTest.test(
+  "the Overview groups the coordinator's threads and names the project",
+  async () => {
+    const h = host({ threads: [thread("here")] });
+    await start(h, "here");
+    h.state.threads.set(
+      "busy",
+      delegated("busy", "coordinator-1", { isRunning: true }),
+    );
+    h.state.threads.set(
+      "other",
+      delegated("other", "here", { isRunning: true }),
+    );
+    const { data } = await h.invoke("view:overview:read", {}, client("busy"));
+    NodeAssert.equal(data.project, "Demo");
+    NodeAssert.equal(data.current, "busy");
+    NodeAssert.equal(data.overview.status.label, "1 working");
+    NodeAssert.deepEqual(
+      data.overview.groups.map((g) => [
+        g.title,
+        g.threads.map((t) => t.threadId),
+      ]),
+      [["Working", ["busy"]]],
+    );
+  },
+);
 
-NodeTest.test("the Projects tree nests each worker under its coordinator, in start order", async () => {
-  const h = host({
-    projects: [
+NodeTest.test(
+  "the Projects tree nests each worker under its coordinator, in start order",
+  async () => {
+    const h = host({
+      projects: [
+        { id: "p", title: "Demo" },
+        { id: "q", title: "Alpha" },
+      ],
+      threads: [thread("here"), thread("elsewhere", { projectId: "q" })],
+    });
+    await start(h, "here");
+    h.state.threads.set(
+      "second",
+      delegated("second", "coordinator-1", {
+        createdAt: "2026-10-25T02:00:00Z",
+        isRunning: true,
+      }),
+    );
+    h.state.threads.set(
+      "first",
+      delegated("first", "coordinator-1", {
+        createdAt: "2026-10-25T01:00:00Z",
+      }),
+    );
+    const { nodes } = await h.tree();
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const parentOf = (threadId) => {
+      const node = nodes.find((candidate) => candidate.threadId === threadId);
+      const parent = byId.get(node.parentId);
+      return parent.kind === "project" ? parent.projectId : parent.threadId;
+    };
+    // Projects in title order; the coordinator leads its project and other live threads follow.
+    NodeAssert.deepEqual(
+      nodes.map((node) => node.projectId ?? node.threadId ?? node.title),
+      ["q", "elsewhere", "p", "coordinator-1", "first", "second", "here"],
+    );
+    NodeAssert.equal(parentOf("coordinator-1"), "p");
+    NodeAssert.equal(parentOf("first"), "coordinator-1");
+    NodeAssert.equal(parentOf("here"), "p");
+    NodeAssert.ok(nodes.every((node) => node.kind !== "group"));
+  },
+);
+
+NodeTest.test(
+  "the tree stays within the call budget and never lists an unlisted project",
+  async () => {
+    const projects = Array.from({ length: 120 }, (_, i) => ({
+      id: `p${i}`,
+      title: `P${i}`,
+    }));
+    const h = host({ projects });
+    const calls = h.state.calls;
+    const { nodes } = await h.tree();
+    NodeAssert.ok(
+      h.state.calls - calls <= 80,
+      `${h.state.calls - calls} calls`,
+    );
+    NodeAssert.ok(nodes.length > 0);
+  },
+);
+
+NodeTest.test(
+  "a project without a coordinator offers it on its heading, where the host can",
+  async () => {
+    const projects = [
       { id: "p", title: "Demo" },
       { id: "q", title: "Alpha" },
-    ],
-    threads: [thread("here"), thread("elsewhere", { projectId: "q" })],
-  });
-  await start(h, "here");
-  h.state.threads.set(
-    "second",
-    delegated("second", "coordinator-1", { createdAt: "2026-10-25T02:00:00Z", isRunning: true }),
-  );
-  h.state.threads.set(
-    "first",
-    delegated("first", "coordinator-1", { createdAt: "2026-10-25T01:00:00Z" }),
-  );
-  const { nodes } = await h.tree();
-  const byId = new Map(nodes.map((node) => [node.id, node]));
-  const parentOf = (threadId) => {
-    const node = nodes.find((candidate) => candidate.threadId === threadId);
-    const parent = byId.get(node.parentId);
-    return parent.kind === "project" ? parent.projectId : parent.threadId;
-  };
-  // Projects in title order; the coordinator leads its project and other live threads follow.
-  NodeAssert.deepEqual(
-    nodes.map((node) => node.projectId ?? node.threadId ?? node.title),
-    ["q", "elsewhere", "p", "coordinator-1", "first", "second", "here"],
-  );
-  NodeAssert.equal(parentOf("coordinator-1"), "p");
-  NodeAssert.equal(parentOf("first"), "coordinator-1");
-  NodeAssert.equal(parentOf("here"), "p");
-  NodeAssert.ok(nodes.every((node) => node.kind !== "group"));
-});
-
-NodeTest.test("the tree stays within the call budget and never lists an unlisted project", async () => {
-  const projects = Array.from({ length: 120 }, (_, i) => ({ id: `p${i}`, title: `P${i}` }));
-  const h = host({ projects });
-  const calls = h.state.calls;
-  const { nodes } = await h.tree();
-  NodeAssert.ok(h.state.calls - calls <= 80, `${h.state.calls - calls} calls`);
-  NodeAssert.ok(nodes.length > 0);
-});
+    ];
+    const heading = async (h, projectId) =>
+      (await h.tree()).nodes.find(
+        (node) => node.kind === "project" && node.projectId === projectId,
+      );
+    const plain = host({ projects, threads: [thread("here")] });
+    NodeAssert.equal((await heading(plain, "p")).actionId, undefined);
+    const h = host({
+      projects,
+      threads: [thread("here")],
+      capabilities: ["ui.native-tree-actions"],
+    });
+    NodeAssert.equal((await heading(h, "p")).actionId, "start-coordinator");
+    // Reading the tree starts nothing; the click does, and then the coordinator's row takes over.
+    NodeAssert.equal(h.state.created.length, 0);
+    await h.invoke(
+      "action:start-coordinator",
+      {},
+      { ...client(), context: { projectId: "p" } },
+    );
+    NodeAssert.equal((await heading(h, "p")).actionId, undefined);
+    NodeAssert.equal((await heading(h, "q")).actionId, "start-coordinator");
+  },
+);

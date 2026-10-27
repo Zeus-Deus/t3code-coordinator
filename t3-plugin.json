@@ -1,7 +1,7 @@
 {
   "id": "zeus-deus.coordinator",
   "name": "Project Coordinator",
-  "description": "One long-running coordinator thread per project. It hands work to parallel threads through T3, and a Projects tab in the sidebar nests those threads under it with their live status. Agents share a short project memory.",
+  "description": "One long-running coordinator thread per project, one click away in a Projects tab that nests the threads it starts under it with their live status. An Overview beside the coordinator groups those threads by state, and agents share a short project memory.",
   "version": "0.1.0",
   "apiVersion": 1,
   "entry": "plugin.mjs",
@@ -14,12 +14,19 @@
     "ui.native-trees",
     "ui.changes"
   ],
+  "optionalCapabilities": ["ui.native-tree-actions"],
   "actions": [
     {
       "id": "coordinator",
       "title": "Open project coordinator",
       "description": "Open this project's coordinator thread, starting one if it has none.",
       "placements": ["palette", "thread-menu"]
+    },
+    {
+      "id": "start-coordinator",
+      "title": "Start coordinator",
+      "description": "Start this project's coordinator thread from the Projects tab.",
+      "placements": []
     },
     {
       "id": "guide",
@@ -45,18 +52,18 @@
   ],
   "views": [
     {
-      "id": "project",
-      "title": "Project",
-      "entry": "views/project.html",
+      "id": "overview",
+      "title": "Overview",
+      "entry": "views/overview.html",
       "placement": "side-panel"
     }
   ],
   "threadStatus": [
     {
-      "id": "project",
-      "title": "Project",
+      "id": "overview",
+      "title": "Overview",
       "icon": "activity",
-      "viewId": "project"
+      "viewId": "overview"
     }
   ],
   "nativeTrees": [
