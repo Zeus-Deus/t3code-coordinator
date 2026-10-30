@@ -1278,6 +1278,26 @@ NodeTest.test("only a project's main conversation asks, about another project", 
   NodeAssert.deepEqual(h.state.accessRequests, []);
 });
 
+NodeTest.test("a full store refuses a new ask rather than lose a reply route", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  const store = h.state.storage.get("handoffs.v1");
+  const [first] = store.handoffs;
+  for (let i = 1; i < 100; i++)
+    store.handoffs.push({ ...first, id: `unanswered-${i}` });
+  const refused = ask(h, { message: "One more." });
+  await NodeAssert.rejects(refused, /still unanswered, so nothing was sent/);
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 100);
+  // The oldest route still works, and its reply frees a place.
+  await h.invoke("action:reply-project", { handoffId, message: "Done." }, agent(target));
+  await ask(h, { message: "One more." });
+  NodeAssert.equal(asked(h).length, 3);
+  const stored = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(stored.length, 100);
+  NodeAssert.ok(!stored.some((entry) => entry.id === handoffId));
+});
+
 NodeTest.test("waiting messages are bounded", async () => {
   const h = await askingHost();
   for (let i = 0; i < 10; i++) await ask(h, { message: `Message ${i}.` });

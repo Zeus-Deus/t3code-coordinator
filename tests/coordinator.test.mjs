@@ -530,17 +530,24 @@ NodeTest.test("a message from another project carries no authority", () => {
   NodeAssert.match(reply, /no authority/);
 });
 
-NodeTest.test("stored handoffs stay bounded and never lose an unsent message", () => {
-  const entry = (id, status) => ({ id, status });
+NodeTest.test("stored handoffs stay bounded and never lose an unanswered one", () => {
+  const entry = (id, status, reply = null) => ({ id, status, reply });
   let store = decodeHandoffs(null);
-  store = putHandoff(store, entry("kept", "pending"));
+  store = putHandoff(store, entry("unsent", "pending"));
+  store = putHandoff(store, entry("sending", "sending"));
+  store = putHandoff(store, entry("waiting", "sent"));
+  const answered = { text: "Done." };
   for (let i = 0; i < HANDOFF_LIMITS.handoffs + 20; i++)
-    store = putHandoff(store, entry(`sent-${i}`, "sent"));
+    store = putHandoff(store, entry(`answered-${i}`, "sent", answered));
   NodeAssert.equal(store.handoffs.length, HANDOFF_LIMITS.handoffs);
-  NodeAssert.equal(store.handoffs[0].id, "kept");
-  NodeAssert.equal(store.handoffs[1].id, "sent-21");
-  NodeAssert.equal(store.handoffs.at(-1).id, `sent-${HANDOFF_LIMITS.handoffs + 19}`);
-  const updated = putHandoff(store, { id: "kept", status: "sent" });
+  NodeAssert.deepEqual(
+    store.handoffs.slice(0, 3).map((h) => h.id),
+    ["unsent", "sending", "waiting"],
+  );
+  NodeAssert.equal(store.handoffs[3].id, `answered-${HANDOFF_LIMITS.handoffs + 19 - 96}`);
+  const declined = putHandoff(store, entry("gone", "declined"));
+  NodeAssert.equal(declined.handoffs.length, HANDOFF_LIMITS.handoffs);
+  const updated = putHandoff(store, entry("unsent", "sent"));
   NodeAssert.equal(updated.handoffs.length, HANDOFF_LIMITS.handoffs);
   NodeAssert.equal(updated.handoffs[0].status, "sent");
   NodeAssert.throws(() => decodeHandoffs({ version: 2 }), /unknown format/);

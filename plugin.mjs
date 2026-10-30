@@ -16,6 +16,7 @@ import {
   handoffText,
   hashId,
   isProjectConversation,
+  isUnanswered,
   isWorker,
   memoryKey,
   messagePreview,
@@ -522,6 +523,13 @@ export function activate(ctx) {
       )
         throw new Error(
           "Too many messages are waiting to go out. Ask the person to answer the project cards first.",
+        );
+      if (
+        !repeated &&
+        store.handoffs.filter(isUnanswered).length >= HANDOFF_LIMITS.handoffs
+      )
+        throw new Error(
+          "Too many asks are still unanswered, so nothing was sent. Stop here and tell the person.",
         );
       const handoff = {
         id,

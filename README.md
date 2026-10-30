@@ -50,8 +50,9 @@ needs a build that can ask for a project from a conversation; older builds refus
 - **Not now** on a project card sends nothing, and T3 won't ask about that project again until you
   next write in that conversation.
 - **Removing the plugin's access** to a project takes it out of the Overview; rows already in a
-  conversation stop naming it. The plugin keeps a short preview of the latest 100 messages between
-  projects, and each conversation shows only its own.
+  conversation stop naming it. The plugin keeps a short preview of up to 100 asks between projects,
+  answered ones going first, and each conversation shows only its own. An unanswered ask is never
+  dropped, so once all 100 are unanswered, new asks are refused until replies arrive.
 
 ## Development
 
