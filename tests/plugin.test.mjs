@@ -1704,6 +1704,22 @@ NodeTest.test("a retry of a counted ask isn't a new one", async (t) => {
   NodeAssert.equal(asked(h).length, 10);
 });
 
+NodeTest.test("a replay of an evicted ask isn't counted or sent again", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  const invocation = agent("coordinator-1", "evicted");
+  await ask(h, {}, invocation);
+  const store = h.state.storage.get("handoffs.v1");
+  const counted = store.recentAsks.length;
+  store.handoffs.length = 0;
+  const replay = await ask(h, {}, invocation);
+  NodeAssert.equal(replay.data.status, "used");
+  NodeAssert.match(replay.message, /already used and its ask is gone/);
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").recentAsks.length, counted);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 0);
+});
+
 NodeTest.test("121 alternating asks stop at the bound with no person involved", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-30T12:00:00Z") });
   const h = await askingHost();

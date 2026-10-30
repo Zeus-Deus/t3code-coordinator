@@ -7,6 +7,7 @@ import {
   askMarker,
   askMessage,
   askQuotaSpent,
+  askUsedRecently,
   BRIEF,
   buildTree,
   CONVERSATION_BRIEF,
@@ -573,6 +574,12 @@ export function activate(ctx) {
       const digest = hashId(text);
       const store = await readHandoffs();
       const repeated = repeatedAsk(store, { id, digest, projectId });
+      if (!repeated && askUsedRecently(store, id))
+        return {
+          message:
+            "That operationId was already used and its ask is gone, so nothing was sent. If it still matters, use a new operationId.",
+          data: { status: "used" },
+        };
       // A retry of a counted ask isn't a new one, so it still goes through.
       if (!repeated && askQuotaSpent(store, from.projectId, projectId))
         return {
