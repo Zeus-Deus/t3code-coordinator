@@ -623,6 +623,12 @@ export function activate(ctx) {
         message: `That message already went out. Its reply arrives in this conversation; end your turn.${await retryNote(from.id, invocation)}`,
         data: { handoffId: repeated.id, status: "sent" },
       };
+    if (repeated && isUndelivered(repeated) && !keepsPlace(repeated))
+      return {
+        message:
+          "This ask is over a week old and was never confirmed, so it may have arrived and nothing was sent. If it's still needed, ask again with a new operationId.",
+        data: { handoffId: repeated.id, status: "stale" },
+      };
     // Before the host hears of it: past 64 requests it drops its oldest unanswered one, so an ask
     // refused here must not cost a real card its place.
     if (

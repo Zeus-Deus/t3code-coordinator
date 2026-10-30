@@ -11,6 +11,7 @@ import {
   decodeCoordinators,
   decodeHandoffs,
   discardAsks,
+  expireHandoffs,
   GUIDE,
   groupWorkers,
   HANDOFF_LIMITS,
@@ -656,4 +657,16 @@ NodeTest.test("an evicted open ask can't be sent again by a late retry", () => {
   NodeAssert.ok(!store.handoffs.some((entry) => entry.id === "old-0"));
   NodeAssert.ok(askUsedRecently(store, "old-0", at + 86_400_000));
   NodeAssert.ok(!askUsedRecently(store, "new", at));
+});
+
+NodeTest.test("discarding an ask that has just expired still stops a late retry", () => {
+  const at = Date.parse("2026-10-02T00:00:00Z");
+  const store = expireHandoffs(
+    { ...decodeHandoffs(null), handoffs: [openAsk()] },
+    at,
+  );
+  NodeAssert.equal(store.handoffs[0].status, "expired");
+  const after = discardAsks(store, "c", hashId("q"), at);
+  NodeAssert.deepEqual(after.handoffs, []);
+  NodeAssert.ok(askUsedRecently(after, "ask-1", at + 86_400_000));
 });

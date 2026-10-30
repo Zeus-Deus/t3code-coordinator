@@ -1312,6 +1312,19 @@ NodeTest.test("an ask past its week isn't retried with a later delivery", async 
   NodeAssert.match(asked(h)[0].text, /^A later ask\./);
 });
 
+NodeTest.test("retrying an ask past its week says so and sends nothing", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "aged-retry");
+  await lostAfterSend(h, invocation);
+  const [aged] = h.state.storage.get("handoffs.v1").handoffs;
+  aged.createdAt = new Date(Date.now() - 8 * 86_400_000).toISOString();
+  const sends = h.state.sent.length;
+  const result = await ask(h, {}, invocation);
+  NodeAssert.equal(result.data.status, "stale");
+  NodeAssert.match(result.message, /new operationId/);
+  NodeAssert.equal(h.state.sent.length, sends);
+});
+
 NodeTest.test("an attempt of unknown outcome doesn't hold up later asks", async () => {
   const h = await askingHost();
   const invocation = agent("coordinator-1", "unknown-first");
