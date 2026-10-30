@@ -195,9 +195,60 @@
       .ready {
         color: var(--success);
       }
+      .replied {
+        color: var(--success);
+      }
       .done,
+      .sent,
       .done + .context .title {
         color: var(--muted);
+      }
+      /* A thread-height row: the name, then as much of the latest message as fits. */
+      .row .preview {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        color: var(--muted);
+        font-size: 12px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .row > .title {
+        flex: none;
+        max-width: 55%;
+      }
+      .row .chevron {
+        width: 12px;
+        height: 12px;
+        color: var(--muted);
+        transition: transform 120ms ease;
+      }
+      .row[aria-expanded="true"] .chevron {
+        transform: rotate(90deg);
+      }
+      /* Hangs from the row's status icon. */
+      .history {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin: 2px 0 8px calc(var(--inset) + 6px);
+        padding-left: 18px;
+        border-left: 1px solid var(--input);
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .history p {
+        overflow-wrap: anywhere;
+      }
+      .history .who {
+        color: var(--fg);
+      }
+      .history button {
+        align-self: flex-start;
+        color: var(--muted);
+      }
+      .history button:hover {
+        color: var(--fg);
       }
       .empty {
         padding: 0 var(--inset);
@@ -307,6 +358,14 @@
         </p>
       </section>
 
+      <section id="others" hidden>
+        <p class="label">
+          <span>Other projects</span>
+          <span class="count" id="others-count"></span>
+        </p>
+        <div id="other-rows"></div>
+      </section>
+
       <section id="memory">
         <p class="label">Memory</p>
         <p class="muted hint">
@@ -342,10 +401,12 @@
             '<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>',
           ready: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
           done: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+          replied: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+          sent: '<circle cx="12" cy="12" r="10"/>',
           chevron: '<path d="m9 18 6-6-6-6"/>',
           remove: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
         };
-        var state = { data: null, doneOpen: false };
+        var state = { data: null, doneOpen: false, openProjects: {} };
 
         function icon(name, className) {
           var svg = document.createElementNS(
@@ -445,6 +506,49 @@
           });
         }
 
+        function renderOthers(others) {
+          var root = $("other-rows");
+          root.replaceChildren();
+          $("others").hidden = others.length === 0;
+          $("others-count").textContent = String(others.length);
+          others.forEach(function (other) {
+            var open = !!state.openProjects[other.projectId];
+            var row = el("button", "row");
+            row.type = "button";
+            row.setAttribute("aria-expanded", String(open));
+            row.append(
+              icon(other.state, other.state),
+              el("span", "title", other.project),
+              el("span", "preview", other.preview),
+              icon("chevron", "chevron"),
+            );
+            row.addEventListener("click", function () {
+              state.openProjects[other.projectId] = !open;
+              renderOthers(others);
+            });
+            root.append(row);
+            if (!open) return;
+            var history = el("div", "history");
+            other.history.forEach(function (line) {
+              var item = el("p");
+              item.append(
+                el("span", "who", line.who + ": "),
+                document.createTextNode(line.text),
+              );
+              history.append(item);
+            });
+            if (other.threadId) {
+              var link = el("button", "", "Open " + other.project + " ›");
+              link.type = "button";
+              link.addEventListener("click", function () {
+                reveal(other.threadId);
+              });
+              history.append(link);
+            }
+            root.append(history);
+          });
+        }
+
         function renderNotes(notes) {
           var list = $("notes");
           list.replaceChildren();
@@ -478,7 +582,7 @@
           $("summary").textContent = data.overview
             ? data.scan && !data.scan.complete
               ? "Partial scan"
-              : data.overview.status.label
+              : data.summary
             : "";
           $("threads").hidden = !data.coordinator;
           // From one of its threads, the link goes back to the project's conversation.
@@ -495,6 +599,7 @@
             if (data.overview) renderGroups(data.overview);
             else $("groups").replaceChildren();
           }
+          renderOthers(data.others);
           renderNotes(data.notes);
         }
 

@@ -53,7 +53,25 @@ function host({
     failedProjects: new Set(),
     threadLists: [],
     projectListingFailsAt: null,
+    sent: [],
+    accessRequests: [],
+    declinedProjects: new Set(),
+    sendError: null,
+    handler: null,
+    caller: null,
+    contextThreadId: null,
   };
+  const denied = () =>
+    Object.assign(new Error("Permission denied."), {
+      reason: "permission_denied",
+    });
+  // The verified sender, as the host resolves it: nobody but an agent or a person's action has one.
+  const sender = () =>
+    state.caller?.kind === "agent"
+      ? state.caller.threadId
+      : state.handler?.startsWith("action:")
+        ? state.contextThreadId
+        : undefined;
   const handlers = new Map();
   let tree;
   const counted =
@@ -103,10 +121,13 @@ function host({
         if (state.createError) throw state.createError;
         const threadId = `coordinator-${state.created.length + 1}`;
         state.created.push(input);
+        // The host records the caller as the launcher, wherever the new thread lives.
+        const launcher = sender();
         state.threads.set(
           threadId,
           thread(threadId, {
             projectId: input.projectId,
+            ...(launcher ? { launchedFrom: { threadId: launcher } } : {}),
             ...(input.owner
               ? {
                   pluginOwner: {
@@ -127,12 +148,40 @@ function host({
         return { threadId };
       }),
       unarchive: counted(async ({ threadId }) => {
+        if (state.caller?.kind !== "client") throw denied();
         state.unarchived.push(threadId);
         state.threads.get(threadId).archivedAt = null;
         return { threadId };
       }),
+      send: counted(async (input) => {
+        if (state.sendError) throw state.sendError;
+        const target = state.threads.get(input.threadId);
+        if (!target || target.deleted) throw denied();
+        if (state.deniedProjects.has(target.projectId)) throw denied();
+        const from = input.fromConversation ? sender() : undefined;
+        if (input.fromConversation) {
+          const source = state.threads.get(from);
+          if (!source || state.deniedProjects.has(source.projectId))
+            throw denied();
+        }
+        if (target.archivedAt) throw new Error("The thread is archived.");
+        state.sent.push({ ...input, senderThreadId: from });
+        return { threadId: input.threadId, runId: "run", delivery: "started" };
+      }),
     },
     projects: {
+      requestAccess: counted(async (request) => {
+        if (!state.caller || state.handler?.startsWith("view:")) throw denied();
+        if (!state.threads.get(request.threadId)?.pluginOwner) throw denied();
+        state.accessRequests.push(request);
+        if (!state.deniedProjects.has(request.projectId))
+          return { status: "granted" };
+        return {
+          status: state.declinedProjects.has(request.projectId)
+            ? "declined"
+            : "pending",
+        };
+      }),
       list: counted(async ({ cursor = 0, limit }) => {
         NodeAssert.ok(limit <= 200);
         if (cursor === state.projectListingFailsAt)
@@ -155,7 +204,12 @@ function host({
   return {
     state,
     handlers,
-    invoke: (name, input, invocation) => handlers.get(name)(input, invocation),
+    invoke: async (name, input, invocation) => {
+      state.handler = name;
+      state.caller = invocation?.caller ?? null;
+      state.contextThreadId = invocation?.context?.threadId;
+      return handlers.get(name)(input, invocation);
+    },
     tree: () => tree({ signal: new AbortController().signal }),
   };
 }
@@ -867,4 +921,692 @@ NodeTest.test("the panel shows working projects, accessible scope, partial count
   await refresh();
   NodeAssert.equal(elements.get("no-threads").hidden, true);
   NodeAssert.equal(elements.get("partial").hidden, false);
+});
+
+const HANDOFF_CAPABILITIES = [
+  "ui.native-tree-conversations",
+  "ui.native-tree-projects",
+];
+
+/** Shelf has a coordinator (coordinator-1); the plugin holds Atlas only once a person adds it. */
+async function askingHost() {
+  const h = host({
+    projects: [
+      { id: "p", title: "Shelf" },
+      { id: "q", title: "Atlas" },
+      { id: "r", title: "Harbor" },
+    ],
+    capabilities: HANDOFF_CAPABILITIES,
+  });
+  await h.invoke("action:new-project", {}, personIn({ projectId: "p" }));
+  h.state.deniedProjects.add("q");
+  return h;
+}
+const createdInAtlas = (h) =>
+  h.state.created.filter((request) => request.projectId === "q");
+const personIn = (context) => ({ ...client(), context });
+const ask = (h, input = {}, invocation = agent("coordinator-1")) =>
+  h.invoke(
+    "action:ask-project",
+    { projectId: "q", message: "Please add a health check.", ...input },
+    invocation,
+  );
+/** What the host does when a person answers its card. */
+const answer = (h, decision, projectId = "q", threadId = "coordinator-1") => {
+  if (decision === "granted") h.state.deniedProjects.delete(projectId);
+  else h.state.declinedProjects.add(projectId);
+  return h.invoke(
+    "action:project-access",
+    { projectAccess: decision },
+    personIn({ projectId, threadId }),
+  );
+};
+const row = async (h, handoffId, threadId = "coordinator-1") =>
+  (await h.invoke("view:asked:read", { handoffId }, client(threadId))).data;
+const panel = async (h, threadId = "coordinator-1") =>
+  (await h.invoke("view:overview:read", {}, client(threadId))).data;
+const asked = (h) => h.state.sent.filter((m) => m.fromConversation);
+const notes = (h) => h.state.sent.filter((m) => !m.fromConversation);
+/** Grants Atlas and sends one message, leaving Atlas's new conversation as `target`. */
+async function delivered(h, input) {
+  h.state.deniedProjects.delete("q");
+  const result = await ask(h, input);
+  return { handoffId: result.data.handoffId, target: asked(h).at(-1).threadId };
+}
+
+NodeTest.test(
+  "a message waits for the person's Add, then opens the project's conversation as the asker",
+  async () => {
+    const h = await askingHost();
+    const result = await ask(h);
+    NodeAssert.equal(result.data.status, "pending");
+    NodeAssert.match(result.message, /card/);
+    NodeAssert.deepEqual(h.state.sent, []);
+    NodeAssert.deepEqual(createdInAtlas(h), []);
+    NodeAssert.deepEqual(h.state.accessRequests, [
+      {
+        projectId: "q",
+        threadId: "coordinator-1",
+        actionId: "project-access",
+      },
+    ]);
+    // The row is there from the first call, and names nothing the plugin can't read yet.
+    NodeAssert.equal(result.card.viewId, "asked");
+    NodeAssert.equal(result.card.summary, "Asked another project");
+    const { handoffId } = result.card.data;
+    NodeAssert.deepEqual(await row(h, handoffId), {
+      title: "Asked another project",
+      threadId: null,
+      state: "sent",
+      label: "Waiting for access",
+    });
+
+    await answer(h, "granted");
+    const [created] = createdInAtlas(h);
+    NodeAssert.equal(createdInAtlas(h).length, 1);
+    NodeAssert.equal(created.projectId, "q");
+    NodeAssert.equal(created.title, "Atlas");
+    NodeAssert.equal(created.owner, "tree:projects");
+    const [sent] = h.state.sent;
+    NodeAssert.equal(h.state.sent.length, 1);
+    NodeAssert.equal(sent.fromConversation, true);
+    NodeAssert.equal(sent.senderThreadId, "coordinator-1");
+    NodeAssert.match(sent.text, /^Please add a health check\./);
+    NodeAssert.match(sent.text, new RegExp(`handoffId "${handoffId}"`));
+    // A plugin's message doesn't carry the brief, so the guide is named here.
+    NodeAssert.match(sent.text, /coordinator guide/);
+    NodeAssert.deepEqual(await row(h, handoffId), {
+      title: "Asked Atlas",
+      threadId: sent.threadId,
+      state: "sent",
+      label: "Sent",
+    });
+    NodeAssert.ok(h.state.invalidated.includes("view:asked"));
+    NodeAssert.ok(h.state.invalidated.includes("tree:projects"));
+    // The person's answer needs no note: the row moved and the reply will arrive here.
+    NodeAssert.deepEqual(notes(h), []);
+  },
+);
+
+NodeTest.test("a project the plugin already holds gets the message at once", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  const result = await ask(h);
+  NodeAssert.equal(result.data.status, "sent");
+  NodeAssert.equal(result.card.summary, "Asked Atlas");
+  NodeAssert.equal(asked(h)[0].senderThreadId, "coordinator-1");
+});
+
+NodeTest.test(
+  "Not now keeps the message out of the project and tells the agent plainly",
+  async () => {
+    const h = await askingHost();
+    await ask(h);
+    await answer(h, "declined");
+    NodeAssert.deepEqual(asked(h), []);
+    NodeAssert.deepEqual(createdInAtlas(h), []);
+    // Woken with a plain note: the sender label is only for messages between projects.
+    NodeAssert.equal(notes(h).length, 1);
+    NodeAssert.equal(notes(h)[0].threadId, "coordinator-1");
+    NodeAssert.match(notes(h)[0].text, /not now/);
+    NodeAssert.match(notes(h)[0].text, /Tell them plainly/);
+
+    const repeat = await ask(h);
+    NodeAssert.match(repeat.message, /said not now/);
+    NodeAssert.equal(repeat.data.status, "declined");
+    NodeAssert.equal(repeat.card, undefined);
+
+    // Once the person writes again the host opens the question, and the same ask works.
+    h.state.declinedProjects.delete("q");
+    const again = await ask(h);
+    NodeAssert.equal(again.data.status, "pending");
+    await answer(h, "granted");
+    NodeAssert.equal(asked(h).length, 1);
+  },
+);
+
+NodeTest.test(
+  "the row and the store forget a declined message",
+  async () => {
+    const h = await askingHost();
+    const { card } = await ask(h);
+    await answer(h, "declined");
+    NodeAssert.equal((await row(h, card.data.handoffId)).label, "Not added");
+    NodeAssert.doesNotMatch(
+      JSON.stringify(h.state.storage.get("handoffs.v1")),
+      /health check/,
+    );
+  },
+);
+
+NodeTest.test("repeating an unanswered ask adds no card and no second message", async () => {
+  const h = await askingHost();
+  const first = await ask(h);
+  const second = await ask(h);
+  NodeAssert.equal(second.data.handoffId, first.data.handoffId);
+  NodeAssert.equal(second.card, undefined);
+  await answer(h, "granted");
+  const third = await ask(h);
+  NodeAssert.match(third.message, /already went out/);
+  NodeAssert.equal(third.card, undefined);
+  NodeAssert.equal(asked(h).length, 1);
+  // A different message is a different ask, and goes out after the first.
+  await ask(h, { message: "One more thing." });
+  NodeAssert.equal(asked(h).length, 2);
+  NodeAssert.match(asked(h)[1].text, /^One more thing\./);
+});
+
+NodeTest.test("different waiting messages go out in order, once", async () => {
+  const h = await askingHost();
+  await ask(h, { message: "First." });
+  await ask(h, { message: "Second." });
+  await answer(h, "granted");
+  NodeAssert.deepEqual(
+    asked(h).map((m) => m.text.split("\n")[0]),
+    ["First.", "Second."],
+  );
+  NodeAssert.equal(createdInAtlas(h).length, 1);
+});
+
+NodeTest.test("an operationId sends once and can't change its message", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  const invocation = agent("coordinator-1", "retry");
+  const first = await ask(h, {}, invocation);
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.equal(retry.data.handoffId, first.data.handoffId);
+  NodeAssert.equal(asked(h).length, 1);
+  await NodeAssert.rejects(
+    ask(h, { message: "Something else." }, invocation),
+    /already asked something else/,
+  );
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test(
+  "a failed send keeps the message for a retry that delivers it once",
+  async () => {
+    const h = await askingHost();
+    h.state.deniedProjects.delete("q");
+    h.state.sendError = new Error("The plugin could not send to the thread.");
+    const invocation = agent("coordinator-1", "flaky");
+    const first = await ask(h, {}, invocation);
+    NodeAssert.equal(first.data.status, "pending");
+    NodeAssert.match(first.message, /hasn't gone out/);
+    NodeAssert.equal((await row(h, first.data.handoffId)).label, "Not sent");
+    h.state.sendError = null;
+    const retry = await ask(h, {}, invocation);
+    NodeAssert.equal(retry.data.status, "sent");
+    NodeAssert.equal(asked(h).length, 1);
+    NodeAssert.equal(createdInAtlas(h).length, 1);
+  },
+);
+
+NodeTest.test(
+  "a failed delivery after approval wakes the agent, since the answer's return value goes nowhere",
+  async () => {
+    const h = await askingHost();
+    await ask(h);
+    h.state.createError = Object.assign(new Error("No model selection."), {
+      reason: "invalid_input",
+    });
+    await answer(h, "granted");
+    NodeAssert.deepEqual(asked(h), []);
+    NodeAssert.equal(notes(h).length, 1);
+    NodeAssert.match(notes(h)[0].text, /hasn't gone out/);
+    NodeAssert.match(notes(h)[0].text, /Settings → Providers/);
+    h.state.createError = null;
+    const retry = await ask(h);
+    NodeAssert.equal(retry.data.status, "sent");
+    NodeAssert.equal(asked(h).length, 1);
+  },
+);
+
+NodeTest.test(
+  "the host's record decides, so a wrong answer input grants nothing",
+  async () => {
+    const h = await askingHost();
+    await ask(h);
+    // Still ungranted on the host, whatever the input claims.
+    await h.invoke(
+      "action:project-access",
+      { projectAccess: "granted" },
+      personIn({ projectId: "q", threadId: "coordinator-1" }),
+    );
+    NodeAssert.deepEqual(h.state.sent, []);
+  },
+);
+
+NodeTest.test(
+  "another conversation's message waits for its own sender after the answer",
+  async () => {
+    const h = await askingHost();
+    await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+    const other = [...h.state.threads.values()].find((t) => t.projectId === "r");
+    await ask(h, { message: "From Harbor." }, agent(other.id));
+    await ask(h, { message: "From Shelf." });
+    // The host moved the one request to the conversation that asked last.
+    await answer(h, "granted");
+    NodeAssert.equal(asked(h).length, 1);
+    NodeAssert.match(asked(h)[0].text, /^From Shelf\./);
+    NodeAssert.equal(asked(h)[0].senderThreadId, "coordinator-1");
+    NodeAssert.equal(notes(h).length, 1);
+    NodeAssert.equal(notes(h)[0].threadId, other.id);
+    await ask(h, { message: "From Harbor." }, agent(other.id));
+    NodeAssert.equal(asked(h).at(-1).senderThreadId, other.id);
+  },
+);
+
+NodeTest.test(
+  "asks keep one conversation per project, through archived and deleted ones",
+  async () => {
+    const h = await askingHost();
+    const { target } = await delivered(h);
+    await ask(h, { message: "Second." });
+    NodeAssert.equal(createdInAtlas(h).length, 1);
+    NodeAssert.equal(asked(h)[1].threadId, target);
+
+    // Only a person can restore a thread, so the agent is told who has to.
+    h.state.threads.get(target).archivedAt = "2026-10-25T01:00:00Z";
+    const invocation = agent("coordinator-1", "archived");
+    const blocked = await ask(h, { message: "Third." }, invocation);
+    NodeAssert.equal(blocked.data.status, "pending");
+    NodeAssert.match(blocked.message, /New project/);
+    NodeAssert.equal(createdInAtlas(h).length, 1);
+    NodeAssert.deepEqual(h.state.unarchived, []);
+
+    await h.invoke("action:new-project", {}, personIn({ projectId: "q" }));
+    NodeAssert.deepEqual(h.state.unarchived, [target]);
+    await ask(h, { message: "Third." }, invocation);
+    NodeAssert.equal(asked(h)[2].threadId, target);
+
+    h.state.threads.get(target).deleted = true;
+    await ask(h, { message: "Fourth." });
+    NodeAssert.equal(createdInAtlas(h).length, 2);
+    NodeAssert.notEqual(asked(h)[3].threadId, target);
+  },
+);
+
+NodeTest.test("an approval restores an archived conversation rather than duplicating it", async () => {
+  const h = await askingHost();
+  const { target } = await delivered(h);
+  h.state.threads.get(target).archivedAt = "2026-10-25T01:00:00Z";
+  h.state.deniedProjects.add("q");
+  await ask(h, { message: "Back again." });
+  await answer(h, "granted");
+  NodeAssert.deepEqual(h.state.unarchived, [target]);
+  NodeAssert.equal(createdInAtlas(h).length, 1);
+  NodeAssert.equal(asked(h).at(-1).threadId, target);
+});
+
+NodeTest.test("only a project's main conversation asks, about another project", async () => {
+  const h = await askingHost();
+  h.state.threads.set(
+    "worker",
+    delegated("worker", "coordinator-1", { projectId: "p" }),
+  );
+  await NodeAssert.rejects(ask(h, {}, agent("worker")), /main conversation/);
+  await NodeAssert.rejects(
+    ask(h, {}, personIn({ threadId: "coordinator-1" })),
+    /main conversation/,
+  );
+  await NodeAssert.rejects(ask(h, { projectId: "p" }), /this project/);
+  await NodeAssert.rejects(ask(h, { projectId: "" }), /Name the project/);
+  await NodeAssert.rejects(ask(h, { message: " " }), /needs text/);
+  await NodeAssert.rejects(
+    ask(h, { message: "x".repeat(4001) }),
+    /under 4000 characters/,
+  );
+  NodeAssert.deepEqual(h.state.accessRequests, []);
+});
+
+NodeTest.test("waiting messages are bounded", async () => {
+  const h = await askingHost();
+  for (let i = 0; i < 10; i++) await ask(h, { message: `Message ${i}.` });
+  await NodeAssert.rejects(
+    ask(h, { message: "One too many." }),
+    /Too many messages/,
+  );
+});
+
+NodeTest.test(
+  "a reply goes back to the conversation that asked, once, as its sender",
+  async () => {
+    const h = await askingHost();
+    const { handoffId, target } = await delivered(h);
+    const invocation = agent(target, "reply");
+    const reply = { handoffId, message: "The health check is in." };
+    await h.invoke("action:reply-project", reply, invocation);
+    const [, back] = asked(h);
+    NodeAssert.equal(back.threadId, "coordinator-1");
+    NodeAssert.equal(back.senderThreadId, target);
+    NodeAssert.match(back.text, /^The health check is in\./);
+    NodeAssert.match(back.text, /nothing to acknowledge/);
+    NodeAssert.ok(h.state.invalidated.includes("view:overview"));
+
+    // A retry is a no-op; a second reply and a reply to the reply both stop here.
+    await h.invoke("action:reply-project", reply, invocation);
+    NodeAssert.equal(asked(h).length, 2);
+    await NodeAssert.rejects(
+      h.invoke(
+        "action:reply-project",
+        { handoffId, message: "Changed." },
+        invocation,
+      ),
+      /different reply/,
+    );
+    await NodeAssert.rejects(
+      h.invoke("action:reply-project", reply, agent(target)),
+      /one reply/,
+    );
+    await NodeAssert.rejects(
+      h.invoke("action:reply-project", reply, agent("coordinator-1")),
+      /no ask with that handoffId/,
+    );
+    NodeAssert.equal(asked(h).length, 2);
+  },
+);
+
+NodeTest.test(
+  "a reply is refused without a stored handoff addressed to the caller",
+  async () => {
+    const h = await askingHost();
+    const { card } = await ask(h);
+    const { handoffId } = card.data;
+    // Unsent, so nobody has been asked yet.
+    await NodeAssert.rejects(
+      h.invoke(
+        "action:reply-project",
+        { handoffId, message: "Hi." },
+        agent("coordinator-1"),
+      ),
+      /no ask with that handoffId/,
+    );
+    await answer(h, "granted");
+    h.state.threads.set("stranger", thread("stranger", { projectId: "r" }));
+    for (const input of [
+      { handoffId, message: "Hi." },
+      { handoffId: "made-up", message: "Hi." },
+      { threadId: "coordinator-1", message: "Hi." },
+    ])
+      await NodeAssert.rejects(
+        h.invoke("action:reply-project", input, agent("stranger")),
+        /no ask with that handoffId/,
+      );
+    await NodeAssert.rejects(
+      h.invoke(
+        "action:reply-project",
+        { handoffId, message: "Hi." },
+        personIn({ threadId: "coordinator-1" }),
+      ),
+      /main conversation/,
+    );
+    NodeAssert.equal(asked(h).length, 1);
+  },
+);
+
+NodeTest.test(
+  "the Overview's other projects come from the target conversation and its workers",
+  async () => {
+    const h = await askingHost();
+    const before = await panel(h);
+    NodeAssert.deepEqual(before.others, []);
+    NodeAssert.equal(before.summary, "No workers yet");
+
+    const { handoffId, target } = await delivered(h);
+    h.state.threads.set(
+      "shelf-worker",
+      delegated("shelf-worker", "coordinator-1", { projectId: "p" }),
+    );
+    let data = await panel(h);
+    NodeAssert.equal(data.summary, "1 ready for review · waiting on Atlas");
+    NodeAssert.equal(data.others.length, 1);
+    NodeAssert.deepEqual(
+      (({ project, threadId, state, label, preview }) => ({
+        project,
+        threadId,
+        state,
+        label,
+        preview,
+      }))(data.others[0]),
+      {
+        project: "Atlas",
+        threadId: target,
+        state: "sent",
+        label: "Sent",
+        preview: "Please add a health check.",
+      },
+    );
+    // Started by the ask, the conversation is Atlas's own, not one of Shelf's threads.
+    NodeAssert.equal(h.state.threads.get(target).launchedFrom.threadId, "coordinator-1");
+    NodeAssert.equal(data.overview.groups.length, 1);
+    NodeAssert.deepEqual(
+      data.overview.groups[0].threads.map((t) => t.threadId),
+      ["shelf-worker"],
+    );
+
+    h.state.threads.get(target).isRunning = true;
+    data = await panel(h);
+    NodeAssert.equal(data.others[0].state, "working");
+    NodeAssert.equal((await row(h, handoffId)).label, "Working");
+
+    h.state.threads.get(target).isRunning = false;
+    h.state.threads.set("atlas-worker", delegated("atlas-worker", target, {
+      projectId: "q",
+      isRunning: true,
+    }));
+    NodeAssert.equal((await panel(h)).others[0].state, "working");
+    NodeAssert.equal((await row(h, handoffId)).title, "Asked Atlas");
+
+    h.state.threads.get("atlas-worker").needsAttention = true;
+    NodeAssert.equal((await panel(h)).others[0].state, "waiting");
+    h.state.threads.delete("atlas-worker");
+
+    await h.invoke(
+      "action:reply-project",
+      { handoffId, message: "Done on our side." },
+      agent(target),
+    );
+    data = await panel(h);
+    NodeAssert.equal(data.summary, "1 ready for review");
+    NodeAssert.equal(data.others[0].state, "replied");
+    NodeAssert.equal(data.others[0].preview, "Done on our side.");
+    NodeAssert.deepEqual(data.others[0].history, [
+      { who: "Asked", text: "Please add a health check." },
+      { who: "Atlas", text: "Done on our side." },
+    ]);
+  },
+);
+
+NodeTest.test("a pending ask has no name to show, so the Overview waits for it", async () => {
+  const h = await askingHost();
+  await ask(h);
+  const data = await panel(h);
+  NodeAssert.deepEqual(data.others, []);
+  NodeAssert.equal(data.summary, "No workers yet");
+});
+
+NodeTest.test("the subtitle stays short with several projects", async () => {
+  const h = await askingHost();
+  await delivered(h);
+  NodeAssert.equal((await panel(h)).summary, "Waiting on Atlas");
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  await ask(h, { projectId: "r", message: "Hello Harbor." });
+  NodeAssert.match(
+    (await panel(h)).summary,
+    /^Waiting on (Atlas and Harbor|Harbor and Atlas)$/,
+  );
+});
+
+NodeTest.test("revoking a project drops it from the Overview and neutralises its row", async () => {
+  const h = await askingHost();
+  const { handoffId } = await delivered(h);
+  h.state.deniedProjects.add("q");
+  const data = await panel(h);
+  NodeAssert.deepEqual(data.others, []);
+  NodeAssert.equal(data.summary, "No workers yet");
+  NodeAssert.deepEqual(await row(h, handoffId), {
+    title: "Asked another project",
+    threadId: null,
+    state: "sent",
+    label: "No access",
+  });
+  NodeAssert.doesNotMatch(JSON.stringify(data), /Atlas|health check/);
+});
+
+NodeTest.test("a deleted target loses its link but keeps the history", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  h.state.threads.get(target).deleted = true;
+  NodeAssert.equal((await panel(h)).others[0].threadId, null);
+  NodeAssert.equal((await row(h, handoffId)).threadId, null);
+});
+
+NodeTest.test("messages between two projects never reach a third", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  await h.invoke(
+    "action:reply-project",
+    { handoffId, message: "Secret plan." },
+    agent(target),
+  );
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((t) => t.projectId === "r");
+  const third = await panel(h, harbor.id);
+  NodeAssert.deepEqual(third.others, []);
+  NodeAssert.equal(third.overview.groups.length, 0);
+  NodeAssert.equal(await row(h, handoffId, harbor.id), null);
+  NodeAssert.equal(await row(h, handoffId, target), null);
+  // The receiver's own panel doesn't show the asker's history either.
+  NodeAssert.deepEqual((await panel(h, target)).others, []);
+  // A worker Shelf started in Harbor opens Shelf's panel, but not Shelf's messages.
+  h.state.threads.set(
+    "harbor-worker",
+    thread("harbor-worker", {
+      projectId: "r",
+      launchedFrom: { threadId: "coordinator-1" },
+    }),
+  );
+  h.state.storage.get("coordinators.v1").projects.r = undefined;
+  delete h.state.storage.get("coordinators.v1").projects.r;
+  const worker = await panel(h, "harbor-worker");
+  NodeAssert.equal(worker.projectId, "p");
+  NodeAssert.deepEqual(worker.others, []);
+  NodeAssert.doesNotMatch(JSON.stringify(worker), /Secret plan/);
+});
+
+NodeTest.test("the asker's row only reads in its own conversation, from stored state", async () => {
+  const h = await askingHost();
+  await delivered(h);
+  NodeAssert.equal(await row(h, "made-up"), null);
+  NodeAssert.equal(await row(h, undefined), null);
+});
+
+NodeTest.test("the Overview section is hidden when empty, and folds in place", async () => {
+  const html = NodeFs.readFileSync(new URL("../views/overview.html", import.meta.url), "utf8");
+  const element = () => ({
+    children: [], hidden: false, textContent: "", attributes: {}, listeners: {},
+    append(...nodes) { this.children.push(...nodes); },
+    replaceChildren(...nodes) { this.children = nodes; },
+    setAttribute(key, value) { this.attributes[key] = value; },
+    addEventListener(key, handler) { this.listeners[key] = handler; },
+  });
+  const text = (node) => [node.textContent, ...node.children.map(text)].join(" ");
+  const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(([, id]) => [id, element()]));
+  const h = await askingHost();
+  let refresh;
+  const intents = [];
+  NodeVm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+    document: {
+      getElementById: (id) => elements.get(id),
+      createElement: element, createElementNS: element, addEventListener() {},
+      createTextNode: (textContent) => ({ ...element(), textContent }),
+    },
+    window: { t3: {
+      invoke: (name, input) => h.invoke(`view:overview:${name}`, input, client("coordinator-1")),
+      onContext: (handler) => { refresh = handler; },
+      intent: async (intent) => { intents.push(intent); },
+    } },
+  });
+  await refresh();
+  NodeAssert.equal(elements.get("others").hidden, true);
+
+  const { handoffId, target } = await delivered(h);
+  await h.invoke("action:reply-project", { handoffId, message: "All done." }, agent(target));
+  await refresh();
+  NodeAssert.equal(elements.get("others").hidden, false);
+  NodeAssert.equal(elements.get("others-count").textContent, "1");
+  NodeAssert.equal(elements.get("summary").textContent, "No workers yet");
+  const rows = elements.get("other-rows");
+  NodeAssert.equal(rows.children.length, 1);
+  NodeAssert.equal(rows.children[0].attributes["aria-expanded"], "false");
+  NodeAssert.match(text(rows), /Atlas\s+All done\./);
+
+  rows.children[0].listeners.click();
+  NodeAssert.equal(rows.children.length, 2);
+  NodeAssert.equal(rows.children[0].attributes["aria-expanded"], "true");
+  const expanded = text(rows.children[1]);
+  NodeAssert.match(expanded, /Asked: \s*Please add a health check\./);
+  NodeAssert.match(expanded, /Atlas: \s*All done\./);
+  NodeAssert.match(expanded, /Open Atlas ›/);
+  rows.children[1].children.at(-1).listeners.click();
+  NodeAssert.equal(intents[0].threadId, target);
+
+  rows.children[0].listeners.click();
+  NodeAssert.equal(rows.children.length, 1);
+});
+
+NodeTest.test("the asked card reads its handoff and links to the conversation", async () => {
+  const html = NodeFs.readFileSync(new URL("../views/asked.html", import.meta.url), "utf8");
+  const element = () => ({
+    textContent: "", hidden: true, disabled: true, className: "", listeners: {},
+    addEventListener(key, handler) { this.listeners[key] = handler; },
+  });
+  const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(([, id]) => [id, element()]));
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  const intents = [];
+  let invoked;
+  NodeVm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+    document: { getElementById: (id) => elements.get(id), addEventListener() {} },
+    window: { t3: {
+      context: { card: { summary: "Asked Atlas", data: { handoffId } } },
+      invoke: (name, input) => (invoked = h.invoke(`view:asked:${name}`, input, client("coordinator-1"))),
+      onContext() {},
+      intent: async (intent) => { intents.push(intent); },
+    } },
+  });
+  await invoked;
+  await new Promise(setImmediate);
+  NodeAssert.equal(elements.get("title").textContent, "Asked Atlas");
+  NodeAssert.equal(elements.get("status").textContent, "· Sent");
+  NodeAssert.equal(elements.get("row").disabled, false);
+  NodeAssert.equal(elements.get("chevron").hidden, false);
+  elements.get("row").listeners.click();
+  NodeAssert.equal(intents[0].type, "thread.reveal");
+  NodeAssert.equal(intents[0].threadId, target);
+  NodeAssert.doesNotMatch(html, /<form/);
+});
+
+NodeTest.test("the manifest declares the handoff the host needs", () => {
+  const manifest = JSON.parse(
+    NodeFs.readFileSync(new URL("../t3-plugin.json", import.meta.url), "utf8"),
+  );
+  for (const capability of ["threads.send", "projects.request-access", "ui.conversation-cards"])
+    NodeAssert.ok(manifest.capabilities.includes(capability), capability);
+  NodeAssert.notEqual(manifest.version, "0.1.0");
+  const action = (id) => manifest.actions.find((a) => a.id === id);
+  NodeAssert.equal(action("ask-project").agentCallable, true);
+  NodeAssert.equal(action("reply-project").agentCallable, true);
+  // An agent calling it could pass off its own input as a person's answer.
+  NodeAssert.ok(action("project-access"));
+  NodeAssert.notEqual(action("project-access").agentCallable, true);
+  NodeAssert.deepEqual(action("project-access").placements, []);
+  const h = host();
+  for (const { id } of manifest.actions)
+    NodeAssert.ok(h.handlers.has(`action:${id}`), id);
+  NodeAssert.equal(
+    manifest.views.find((view) => view.id === "asked").placement,
+    "conversation",
+  );
 });

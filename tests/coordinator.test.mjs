@@ -7,12 +7,17 @@ import {
   CONVERSATION_BRIEF,
   coordinatorStatus,
   decodeCoordinators,
+  decodeHandoffs,
   GUIDE,
   groupWorkers,
+  HANDOFF_LIMITS,
   isWorker,
   MEMORY_LIMITS,
+  messagePreview,
+  otherProjects,
   projectSection,
   overview,
+  putHandoff,
   TREE_LIMITS,
   workerState,
 } from "../lib/coordinator.mjs";
@@ -335,8 +340,13 @@ NodeTest.test(
       "memory-read",
       "memory-append",
       "t3_thread_organize",
+      "ask-project",
+      "reply-project",
     ])
       NodeAssert.ok(GUIDE.includes(tool), tool);
+    // Work in another project goes through its coordinator, not a launched worker.
+    NodeAssert.doesNotMatch(GUIDE, /Settings → Plugins/);
+    NodeAssert.doesNotMatch(GUIDE, /or for work in another project/);
     NodeAssert.match(GUIDE, /what the project should accomplish/);
     NodeAssert.match(GUIDE, /merges the person agreed to/);
     NodeAssert.match(GUIDE, /check git status and the current branch/);
@@ -494,4 +504,58 @@ NodeTest.test("workers left out of a section don't count towards its Done fold",
   const section = projectSection("p", threads, "c", Date.now(), { crossProject: false });
   NodeAssert.deepEqual(section.workers.map((t) => t.id), ["local"]);
   NodeAssert.deepEqual(section.done, []);
+});
+
+NodeTest.test("stored handoffs stay bounded and never lose an unsent message", () => {
+  const entry = (id, status) => ({ id, status });
+  let store = decodeHandoffs(null);
+  store = putHandoff(store, entry("kept", "pending"));
+  for (let i = 0; i < HANDOFF_LIMITS.handoffs + 20; i++)
+    store = putHandoff(store, entry(`sent-${i}`, "sent"));
+  NodeAssert.equal(store.handoffs.length, HANDOFF_LIMITS.handoffs);
+  NodeAssert.equal(store.handoffs[0].id, "kept");
+  NodeAssert.equal(store.handoffs[1].id, "sent-21");
+  NodeAssert.equal(store.handoffs.at(-1).id, `sent-${HANDOFF_LIMITS.handoffs + 19}`);
+  const updated = putHandoff(store, { id: "kept", status: "sent" });
+  NodeAssert.equal(updated.handoffs.length, HANDOFF_LIMITS.handoffs);
+  NodeAssert.equal(updated.handoffs[0].status, "sent");
+  NodeAssert.throws(() => decodeHandoffs({ version: 2 }), /unknown format/);
+});
+
+NodeTest.test("a preview is one bounded line", () => {
+  NodeAssert.equal(messagePreview(" two\n  lines "), "two lines");
+  const long = messagePreview("word ".repeat(100));
+  NodeAssert.ok(long.length <= HANDOFF_LIMITS.previewChars);
+  NodeAssert.ok(long.endsWith("…"));
+});
+
+NodeTest.test("history shows the latest asks for a project, oldest first", () => {
+  const handoffs = Array.from({ length: 8 }, (_, i) => ({
+    id: `h${i}`,
+    status: "sent",
+    from: { threadId: "c", projectId: "p" },
+    to: { threadId: "t", projectId: "q" },
+    text: `Ask ${i}`,
+    reply: null,
+    sentAt: `2026-10-25T00:00:0${i}Z`,
+  }));
+  const [row] = otherProjects(
+    handoffs,
+    "c",
+    [],
+    new Map([["q", { id: "q", title: "Atlas" }]]),
+  );
+  NodeAssert.equal(row.history.length, HANDOFF_LIMITS.shownPerProject);
+  NodeAssert.equal(row.history[0].text, "Ask 2");
+  NodeAssert.equal(row.preview, "Ask 7");
+  NodeAssert.equal(row.threadId, null);
+});
+
+NodeTest.test("a project conversation an ask started isn't the asker's worker", () => {
+  const conversation = thread("t", {
+    launchedFrom: { threadId: "c" },
+    pluginOwner: { installationId: "self", treeId: "projects" },
+  });
+  NodeAssert.ok(!isWorker(conversation, "c"));
+  NodeAssert.ok(isWorker(thread("w", { launchedFrom: { threadId: "c" } }), "c"));
 });
