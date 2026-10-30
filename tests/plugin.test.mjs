@@ -193,6 +193,11 @@ function host({
             .map((entry) => entry.status),
         );
         if (state.sendError) throw state.sendError;
+        if (state.sendFailsOnce) {
+          const error = state.sendFailsOnce;
+          state.sendFailsOnce = null;
+          throw error;
+        }
         const target = state.threads.get(input.threadId);
         if (!target || target.deleted) throw denied();
         if (state.deniedProjects.has(target.projectId)) throw denied();
@@ -1315,6 +1320,24 @@ NodeTest.test("an attempt of unknown outcome doesn't hold up later asks", async 
   );
 });
 
+NodeTest.test("a failed resend of an unknown attempt doesn't hold up later asks", async () => {
+  const h = await askingHost();
+  await ask(h);
+  h.state.sendError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.sendError = null;
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sending");
+  // Read, not there, and the resend fails: the next ask still goes out.
+  h.state.sendFailsOnce = new Error("Still busy.");
+  const later = await ask(h, { message: "A later ask." });
+  NodeAssert.equal(later.data.status, "sent");
+  NodeAssert.match(later.message, /Still busy\./);
+  NodeAssert.deepEqual(
+    asked(h).map((m) => m.text.split("\n")[0]),
+    ["A later ask."],
+  );
+});
+
 NodeTest.test("a reply proves an attempt of unknown outcome arrived", async () => {
   const h = await askingHost();
   const invocation = agent("coordinator-1", "proved");
@@ -2306,6 +2329,17 @@ NodeTest.test("only the asking project's panel can discard its asks", async () =
   await ask(h);
   const [{ key }] = (await panel(h)).others;
   await h.invoke("view:overview:discard", { key }, client(harbor.id));
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 1);
+  // A worker this project started elsewhere opens its panel, but not its messages.
+  h.state.threads.set(
+    "harbor-worker",
+    thread("harbor-worker", {
+      projectId: "r",
+      launchedFrom: { threadId: "coordinator-1" },
+    }),
+  );
+  delete h.state.storage.get("coordinators.v1").projects.r;
+  await h.invoke("view:overview:discard", { key }, client("harbor-worker"));
   NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 1);
   await h.invoke("view:overview:discard", { key: "made-up" }, client("coordinator-1"));
   NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 1);
