@@ -1055,6 +1055,7 @@ NodeTest.test(
     NodeAssert.match(repeat.message, /said not now/);
     NodeAssert.equal(repeat.data.status, "declined");
     NodeAssert.equal(repeat.card, undefined);
+    NodeAssert.equal(asked(h).length, 0);
 
     // Once the person writes again the host opens the question, and the same ask works.
     h.state.declinedProjects.delete("q");
@@ -1079,21 +1080,31 @@ NodeTest.test(
   },
 );
 
-NodeTest.test("repeating an unanswered ask adds no card and no second message", async () => {
+NodeTest.test("repeating an operationId adds no card and no second message", async () => {
   const h = await askingHost();
-  const first = await ask(h);
-  const second = await ask(h);
+  const invocation = agent("coordinator-1", "same");
+  const first = await ask(h, {}, invocation);
+  const second = await ask(h, {}, invocation);
   NodeAssert.equal(second.data.handoffId, first.data.handoffId);
   NodeAssert.equal(second.card, undefined);
   await answer(h, "granted");
-  const third = await ask(h);
+  const third = await ask(h, {}, invocation);
   NodeAssert.match(third.message, /already went out/);
   NodeAssert.equal(third.card, undefined);
   NodeAssert.equal(asked(h).length, 1);
-  // A different message is a different ask, and goes out after the first.
-  await ask(h, { message: "One more thing." });
+});
+
+NodeTest.test("the same words under a new operationId are a new request", async () => {
+  const h = await askingHost();
+  const first = await ask(h);
+  const second = await ask(h);
+  NodeAssert.notEqual(second.data.handoffId, first.data.handoffId);
+  NodeAssert.ok(second.card);
+  await answer(h, "granted");
   NodeAssert.equal(asked(h).length, 2);
-  NodeAssert.match(asked(h)[1].text, /^One more thing\./);
+  // Identical text after that goes out too: the earlier one is still unanswered.
+  await ask(h);
+  NodeAssert.equal(asked(h).length, 3);
 });
 
 NodeTest.test("different waiting messages go out in order, once", async () => {
@@ -1118,6 +1129,10 @@ NodeTest.test("an operationId sends once and can't change its message", async ()
   NodeAssert.equal(asked(h).length, 1);
   await NodeAssert.rejects(
     ask(h, { message: "Something else." }, invocation),
+    /already asked something else/,
+  );
+  await NodeAssert.rejects(
+    ask(h, { projectId: "r" }, invocation),
     /already asked something else/,
   );
   NodeAssert.equal(asked(h).length, 1);
@@ -1146,7 +1161,8 @@ NodeTest.test(
   "a failed delivery after approval wakes the agent, since the answer's return value goes nowhere",
   async () => {
     const h = await askingHost();
-    await ask(h);
+    const invocation = agent("coordinator-1", "kept");
+    await ask(h, {}, invocation);
     h.state.createError = Object.assign(new Error("No model selection."), {
       reason: "invalid_input",
     });
@@ -1156,7 +1172,7 @@ NodeTest.test(
     NodeAssert.match(notes(h)[0].text, /hasn't gone out/);
     NodeAssert.match(notes(h)[0].text, /Settings → Providers/);
     h.state.createError = null;
-    const retry = await ask(h);
+    const retry = await ask(h, {}, invocation);
     NodeAssert.equal(retry.data.status, "sent");
     NodeAssert.equal(asked(h).length, 1);
   },
@@ -1183,7 +1199,8 @@ NodeTest.test(
     const h = await askingHost();
     await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
     const other = [...h.state.threads.values()].find((t) => t.projectId === "r");
-    await ask(h, { message: "From Harbor." }, agent(other.id));
+    const harbor = agent(other.id, "from-harbor");
+    await ask(h, { message: "From Harbor." }, harbor);
     await ask(h, { message: "From Shelf." });
     // The host moved the one request to the conversation that asked last.
     await answer(h, "granted");
@@ -1192,7 +1209,8 @@ NodeTest.test(
     NodeAssert.equal(asked(h)[0].senderThreadId, "coordinator-1");
     NodeAssert.equal(notes(h).length, 1);
     NodeAssert.equal(notes(h)[0].threadId, other.id);
-    await ask(h, { message: "From Harbor." }, agent(other.id));
+    NodeAssert.match(notes(h)[0].text, /same projectId, message and operationId/);
+    await ask(h, { message: "From Harbor." }, harbor);
     NodeAssert.equal(asked(h).at(-1).senderThreadId, other.id);
   },
 );

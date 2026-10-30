@@ -399,7 +399,7 @@ export function activate(ctx) {
   };
 
   const unsentNote = (problem) =>
-    `Your message to that project hasn't gone out: ${problem} It is kept: call ask-project again with the same message once that's sorted.`;
+    `Your message to that project hasn't gone out: ${problem} It is kept: call ask-project again with the same projectId, message and operationId once that's sorted.`;
 
   /** A plain note in a plugin-owned conversation, for what the agent can't see any other way. */
   const nudge = async (threadId, text) => {
@@ -494,12 +494,7 @@ export function activate(ctx) {
       const id = hashId(from.id, invocation.operationId).slice(0, 16);
       const digest = hashId(text);
       const store = await readHandoffs();
-      const repeated = repeatedAsk(store, {
-        id,
-        digest,
-        threadId: from.id,
-        projectId,
-      });
+      const repeated = repeatedAsk(store, { id, digest, projectId });
       if (repeated?.status === "sent")
         return {
           message:
@@ -608,7 +603,7 @@ export function activate(ctx) {
         for (const other of others)
           await nudge(
             other,
-            "The project you asked was added. Call ask-project again with the same message to send it.",
+            "The project you asked was added. Call ask-project again with the same projectId, message and operationId to send it.",
           );
       }
       await invalidate(HANDOFF_TOPICS);
