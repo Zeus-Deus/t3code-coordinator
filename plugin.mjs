@@ -21,6 +21,8 @@ const COORDINATORS = "coordinators.v1";
 const PAGE = 200;
 // Every page loads the whole project on the host, and statuses and views are read often.
 const SCAN_PAGES = 10;
+// Total scan calls across accessible projects, with headroom for context and memory reads.
+const READ_BUDGET = 70;
 // Host calls one tree read may spend across every project; the rest stay in Other.
 const TREE_BUDGET = 80;
 const TREE = "projects";
@@ -57,9 +59,17 @@ export function activate(ctx) {
   const listThreads = async (projectId, invocation, budget) => {
     const threads = new Map();
     let cursor = 0;
-    while (budget.calls-- > 0) {
+    let pages = 0;
+    while (budget.calls > 0 && pages++ < SCAN_PAGES) {
+      budget.calls--;
       invocation.signal.throwIfAborted();
-      const page = await ctx.threads.list({ projectId, cursor, limit: PAGE });
+      let page;
+      try {
+        page = await ctx.threads.list({ projectId, cursor, limit: PAGE });
+      } catch {
+        invocation.signal.throwIfAborted();
+        break;
+      }
       for (const thread of page.threads) threads.set(thread.id, thread);
       if (page.nextCursor === null)
         return { threads: [...threads.values()], complete: true };
@@ -72,14 +82,52 @@ export function activate(ctx) {
   const listProjects = async (invocation, budget) => {
     const projects = new Map();
     let cursor = 0;
-    while (budget.calls-- > 0) {
+    let pages = 0;
+    while (budget.calls > 0 && pages++ < SCAN_PAGES) {
+      budget.calls--;
       invocation.signal.throwIfAborted();
-      const page = await ctx.projects.list({ cursor, limit: PAGE });
+      let page;
+      try {
+        page = await ctx.projects.list({ cursor, limit: PAGE });
+      } catch {
+        invocation.signal.throwIfAborted();
+        break;
+      }
       for (const project of page.projects) projects.set(project.id, project);
-      if (page.nextCursor === null || !(page.nextCursor > cursor)) break;
+      if (page.nextCursor === null) return { projects, complete: true };
+      if (!(page.nextCursor > cursor)) break;
       cursor = page.nextCursor;
     }
-    return projects;
+    return { projects, complete: false };
+  };
+
+  /** Only the host's grant-filtered project list is a source of scan targets. */
+  const scanAccessible = async (invocation, budget, priority = []) => {
+    const listed = await listProjects(invocation, budget);
+    const projects = [...listed.projects.values()].sort(
+      (a, b) =>
+        Number(priority.includes(b.id)) - Number(priority.includes(a.id)) ||
+        a.title.localeCompare(b.title),
+    );
+    const threads = new Map();
+    const scanned = new Set();
+    let complete = listed.complete;
+    for (const project of projects) {
+      if (budget.calls <= 0) {
+        complete = false;
+        break;
+      }
+      const scan = await listThreads(project.id, invocation, budget);
+      scanned.add(project.id);
+      complete &&= scan.complete;
+      for (const thread of scan.threads) threads.set(thread.id, thread);
+    }
+    return {
+      projects: listed.projects,
+      threads: [...threads.values()],
+      scanned,
+      complete,
+    };
   };
 
   /** The open thread, as the host reports it. */
@@ -99,8 +147,8 @@ export function activate(ctx) {
     return ctx.threads.metadata({ threadId: caller.threadId });
   };
 
-  const liveCoordinator = async (projectId) => {
-    const stored = (await readCoordinators()).projects[projectId];
+  const liveCoordinator = async (projectId, store) => {
+    const stored = store.projects[projectId];
     if (!stored) return null;
     try {
       const thread = await ctx.threads.metadata({ threadId: stored.threadId });
@@ -113,6 +161,26 @@ export function activate(ctx) {
       if (error?.reason === "permission_denied") return null;
       throw error;
     }
+  };
+
+  /** A worker's panel follows its direct launcher, even if its own project has a coordinator. */
+  const overviewContext = async (invocation) => {
+    const thread = await contextThread(invocation);
+    const store = await readCoordinators();
+    const launcher = Object.entries(store.projects).find(
+      ([, coordinator]) => isWorker(thread, coordinator.threadId),
+    );
+    const projectId =
+      store.projects[thread.projectId]?.threadId === thread.id
+        ? thread.projectId
+        : launcher?.[0] ?? thread.projectId;
+    const coordinator = await liveCoordinator(projectId, store);
+    // Stored ids do not grant access to another project's memory after its grant is revoked.
+    return {
+      thread,
+      projectId: coordinator ? projectId : thread.projectId,
+      coordinator,
+    };
   };
 
   const invalidate = async (topics) => {
@@ -222,8 +290,9 @@ export function activate(ctx) {
           await ctx.threads.create({
             ...common,
             title:
-              (await listProjects(invocation, { calls: 2 })).get(projectId)
-                ?.title ?? "Project",
+              (await listProjects(invocation, { calls: 2 })).projects.get(
+                projectId,
+              )?.title ?? "Project",
             brief: CONVERSATION_BRIEF,
             ...(projectsView() ? { owner: OWNER } : {}),
             idempotencyKey: "open-conversation",
@@ -314,23 +383,22 @@ export function activate(ctx) {
   });
 
   ctx.handle(`view:${VIEW}:read`, async (_input, invocation) => {
-    const thread = await contextThread(invocation);
-    const coordinator = await liveCoordinator(thread.projectId);
-    const [{ notes }, projects] = await Promise.all([
-      readMemory(thread.projectId),
-      listProjects(invocation, { calls: 2 }),
+    const { thread, projectId, coordinator } = await overviewContext(invocation);
+    const [{ notes }, scan] = await Promise.all([
+      readMemory(projectId),
+      coordinator
+        ? scanAccessible(invocation, { calls: READ_BUDGET }, [projectId])
+        : listProjects(invocation, { calls: SCAN_PAGES }),
     ]);
-    const scan = coordinator
-      ? await listThreads(thread.projectId, invocation, { calls: SCAN_PAGES })
-      : null;
     return {
       data: {
-        project: projects.get(thread.projectId)?.title ?? null,
+        projectId,
+        project: scan.projects.get(projectId)?.title ?? null,
         coordinator: coordinator && { threadId: coordinator.id },
         current: thread.id,
-        // A partial scan could hide running work, so the panel says so instead of guessing.
-        overview: scan?.complete
-          ? overview(scan.threads, coordinator.id)
+        scan: coordinator ? { complete: scan.complete } : null,
+        overview: coordinator
+          ? overview(scan.threads, coordinator.id, scan.projects)
           : null,
         notes,
       },
@@ -338,8 +406,8 @@ export function activate(ctx) {
   });
 
   ctx.handle(`view:${VIEW}:remember`, async (input, invocation) => {
-    const thread = await contextThread(invocation);
-    const { notes } = await addNote(thread.projectId, {
+    const { thread, projectId } = await overviewContext(invocation);
+    const { notes } = await addNote(projectId, {
       id: hashId("person", invocation.operationId).slice(0, 16),
       text: noteText(input?.text),
       threadId: thread.id,
@@ -349,14 +417,14 @@ export function activate(ctx) {
   });
 
   ctx.handle(`view:${VIEW}:forget`, async (input, invocation) => {
-    const thread = await contextThread(invocation);
+    const { projectId } = await overviewContext(invocation);
     const notes = await serial(async () => {
-      const memory = await readMemory(thread.projectId);
+      const memory = await readMemory(projectId);
       const next = {
         ...memory,
         notes: memory.notes.filter((note) => note.id !== input?.id),
       };
-      await ctx.storage.set(memoryKey(thread.projectId), next);
+      await ctx.storage.set(memoryKey(projectId), next);
       return next.notes;
     });
     await invalidate([`view:${VIEW}`]);
@@ -366,64 +434,81 @@ export function activate(ctx) {
   // Like Claude Code Projects' Overview button, the chip is the same on the coordinator and on
   // every thread it started, so the Overview is one click away wherever the person is.
   ctx.handle(`status:${VIEW}`, async (_input, invocation) => {
-    const thread = await contextThread(invocation);
-    const coordinatorId = (await readCoordinators()).projects[thread.projectId]
-      ?.threadId;
-    if (!coordinatorId || thread.archivedAt) return { data: null };
+    const { thread, projectId, coordinator } = await overviewContext(invocation);
+    if (!coordinator || thread.archivedAt) return { data: null };
+    const coordinatorId = coordinator.id;
     if (thread.id !== coordinatorId && !isWorker(thread, coordinatorId))
       return { data: null };
-    const scan = await listThreads(thread.projectId, invocation, {
-      calls: SCAN_PAGES,
-    });
-    const coordinator = scan.threads.find((t) => t.id === coordinatorId);
+    const scan = await scanAccessible(invocation, { calls: READ_BUDGET }, [
+      projectId,
+    ]);
     // Pages follow thread ids, not activity, so a partial count could hide running work.
-    if (!scan.complete || !coordinator || coordinator.archivedAt)
-      return { data: null };
-    return { data: overview(scan.threads, coordinatorId).status };
+    if (!scan.complete)
+      return { data: { label: "Partial scan · Open Overview", tone: "warning" } };
+    const listedCoordinator = scan.threads.find((t) => t.id === coordinatorId);
+    if (!listedCoordinator || listedCoordinator.archivedAt) return { data: null };
+    const status = overview(scan.threads, coordinatorId).status;
+    const label = status.label.replace("ready for review", "ready");
+    return {
+      data: {
+        ...status,
+        label: `Accessible: ${label}`.slice(0, 40),
+      },
+    };
   });
 
   ctx.trees.register(TREE, async (invocation) => {
     // One call goes to reading the stored coordinators.
     const budget = { calls: TREE_BUDGET - 1 };
-    const [store, projects] = await Promise.all([
-      readCoordinators(),
-      listProjects(invocation, budget),
-    ]);
+    const store = await readCoordinators();
+    const scan = await scanAccessible(
+      invocation,
+      budget,
+      Object.keys(store.projects),
+    );
     const now = Date.now();
     const sections = [];
     const exclusive = projectsView();
-    // As its own view the tab lists only projects with a conversation, so those are the only ones
-    // worth a scan; the host still shows an owned conversation this budget misses.
-    const candidates = [...projects.values()]
-      .filter((project) => !exclusive || store.projects[project.id])
+    // Workers may live in any granted project, including ones without their own conversation.
+    const candidates = [...scan.projects.values()]
+      .filter((project) => scan.scanned.has(project.id))
       .sort((a, b) => a.title.localeCompare(b.title));
     // Only ids this call just listed: one stale reference would make the host reject the tree.
     for (const project of candidates) {
-      if (budget.calls <= 0) break;
-      const { threads, complete } = await listThreads(
-        project.id,
-        invocation,
-        budget,
-      );
       sections.push(
         projectSection(
           project.id,
-          threads,
+          scan.threads,
           store.projects[project.id]?.threadId,
           now,
         ),
       );
-      if (!complete) {
-        ctx.log(
-          "debug",
-          "The Projects tree is bounded; remaining threads stay in Other.",
-        );
-        break;
-      }
     }
+    // A cross-project worker belongs under its launcher, never again under its working project.
+    // A project's own conversation keeps its heading if it was itself launched by another one.
+    const coordinatorIds = new Set(
+      sections.flatMap((s) => (s.coordinator ? [s.coordinator.id] : [])),
+    );
+    const placed = new Set();
+    for (const section of sections) {
+      section.workers = section.workers.filter((t) => !coordinatorIds.has(t.id));
+      section.done = section.done.filter((t) => !coordinatorIds.has(t.id));
+      for (const thread of [...section.workers, ...section.done])
+        placed.add(thread.id);
+    }
+    for (const section of sections)
+      section.others = section.others.filter((t) => !placed.has(t.id));
+    if (!scan.complete)
+      ctx.log(
+        "debug",
+        "The Projects scan is partial; only accessible, scanned threads are placed.",
+      );
     // Conversations started before the Projects view owned them move out of Activity.
     for (const section of sections)
-      if (section.coordinator) await adopt(section.coordinator);
+      if (section.coordinator && budget.calls > 0) {
+        budget.calls--;
+        await adopt(section.coordinator);
+      }
     // Hosts without conversation headings would reject the fields, so they go only where granted.
     return buildTree(sections, {
       openAction: conversations() ? "open-conversation" : undefined,

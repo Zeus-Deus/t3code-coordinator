@@ -175,6 +175,17 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      .row .context {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        padding: 6px 0;
+      }
+      .row .project {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .waiting {
         color: var(--warning);
       }
@@ -185,7 +196,7 @@
         color: var(--success);
       }
       .done,
-      .done + .title {
+      .done + .context .title {
         color: var(--muted);
       }
       .empty {
@@ -284,13 +295,19 @@
 
       <section id="threads" hidden>
         <p class="label">Threads</p>
+        <p class="muted hint" id="scope">
+          Counts cover accessible projects only. Workers in projects this plugin
+          cannot access are excluded.
+        </p>
         <div class="groups" id="groups"></div>
         <p class="muted empty" id="no-threads" hidden>
           Say what you want in the conversation. Each piece of work becomes a
           thread here and under the project in the sidebar.
         </p>
         <p class="muted empty" id="partial" hidden>
-          This project has too many threads to group here.
+          Partial scan: some accessible projects or threads could not be read
+          within this scan. Counts are minimums; running or waiting work may be
+          missing.
         </p>
       </section>
 
@@ -403,7 +420,12 @@
             }
             label.append(
               el("span", "", group.title),
-              el("span", "count", String(group.threads.length)),
+              el(
+                "span",
+                "count",
+                String(group.threads.length) +
+                  (state.data.scan && !state.data.scan.complete ? "+" : ""),
+              ),
             );
             section.append(label);
             if (open) {
@@ -412,10 +434,11 @@
                 row.type = "button";
                 if (thread.threadId === state.data.current)
                   row.setAttribute("aria-current", "true");
-                row.append(
-                  icon(group.id, group.id),
-                  el("span", "title", thread.title),
-                );
+                var context = el("span", "context");
+                context.append(el("span", "title", thread.title));
+                if (thread.projectId !== state.data.projectId)
+                  context.append(el("span", "muted project", thread.project));
+                row.append(icon(group.id, group.id), context);
                 row.addEventListener("click", function () {
                   reveal(thread.threadId);
                 });
@@ -457,7 +480,9 @@
           var data = state.data;
           $("name").textContent = data.project || "Overview";
           $("summary").textContent = data.overview
-            ? data.overview.status.label
+            ? data.scan && !data.scan.complete
+              ? "Partial scan"
+              : data.overview.status.label
             : "";
           $("threads").hidden = !data.coordinator;
           // From one of its threads, the link goes back to the project's conversation.
@@ -467,9 +492,10 @@
             ? "Back to " + data.project
             : "Back to the conversation";
           if (data.coordinator) {
-            $("partial").hidden = !!data.overview;
+            var complete = data.scan && data.scan.complete;
+            $("partial").hidden = !!complete;
             $("no-threads").hidden =
-              !data.overview || data.overview.groups.length > 0;
+              !complete || !data.overview || data.overview.groups.length > 0;
             if (data.overview) renderGroups(data.overview);
             else $("groups").replaceChildren();
           }

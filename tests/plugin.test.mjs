@@ -1,6 +1,7 @@
 import * as NodeAssert from "node:assert/strict";
 import * as NodeFs from "node:fs";
 import * as NodeTest from "node:test";
+import * as NodeVm from "node:vm";
 import { activate } from "../plugin.mjs";
 
 const thread = (id, extra = {}) => ({
@@ -39,6 +40,7 @@ function host({
   projects = [{ id: "p", title: "Demo" }],
   threads = [],
   capabilities = [],
+  projectPageSize = 200,
 } = {}) {
   const state = {
     storage: new Map(),
@@ -47,6 +49,10 @@ function host({
     unarchived: [],
     invalidated: [],
     calls: 0,
+    deniedProjects: new Set(),
+    failedProjects: new Set(),
+    threadLists: [],
+    projectListingFailsAt: null,
   };
   const handlers = new Map();
   let tree;
@@ -72,7 +78,7 @@ function host({
     threads: {
       metadata: counted(async ({ threadId }) => {
         const found = state.threads.get(threadId);
-        if (!found || found.deleted)
+        if (!found || found.deleted || state.deniedProjects.has(found.projectId))
           throw Object.assign(new Error("Permission denied."), {
             reason: "permission_denied",
           });
@@ -80,6 +86,11 @@ function host({
       }),
       list: counted(async ({ projectId, cursor = 0, limit }) => {
         NodeAssert.ok(limit <= 200);
+        state.threadLists.push(projectId);
+        if (state.deniedProjects.has(projectId) || state.failedProjects.has(projectId))
+          throw Object.assign(new Error("Project unavailable."), {
+            reason: "permission_denied",
+          });
         const rows = [...state.threads.values()]
           .filter((t) => t.projectId === projectId && !t.deleted)
           .sort((a, b) => a.id.localeCompare(b.id));
@@ -120,7 +131,19 @@ function host({
         return { threadId };
       }),
     },
-    projects: { list: counted(async () => ({ projects, nextCursor: null })) },
+    projects: {
+      list: counted(async ({ cursor = 0, limit }) => {
+        NodeAssert.ok(limit <= 200);
+        if (cursor === state.projectListingFailsAt)
+          throw new Error("Project listing failed.");
+        const visible = projects.filter((p) => !state.deniedProjects.has(p.id));
+        const end = cursor + Math.min(limit, projectPageSize);
+        return {
+          projects: structuredClone(visible.slice(cursor, end)),
+          nextCursor: end < visible.length ? end : null,
+        };
+      }),
+    },
     ui: {
       invalidate: async (topics) => void state.invalidated.push(...topics),
     },
@@ -346,13 +369,13 @@ NodeTest.test(
     );
     const status = async (id) =>
       (await h.invoke("status:overview", {}, client(id))).data;
-    const waiting = { label: "1 waiting on you", tone: "warning" };
+    const waiting = { label: "Accessible: 1 waiting on you", tone: "warning" };
     NodeAssert.deepEqual(await status("coordinator-1"), waiting);
     NodeAssert.deepEqual(await status("busy"), waiting);
     NodeAssert.equal(await status("bystander"), null);
     // The coordinator's own question counts alongside its threads'.
     h.state.threads.get("coordinator-1").needsAttention = true;
-    NodeAssert.equal((await status("busy")).label, "2 waiting on you");
+    NodeAssert.equal((await status("busy")).label, "Accessible: 2 waiting on you");
     h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
     NodeAssert.equal(await status("coordinator-1"), null);
     NodeAssert.equal(await status("busy"), null);
@@ -360,7 +383,7 @@ NodeTest.test(
 );
 
 NodeTest.test(
-  "the coordinator's status stays hidden when its count would be partial",
+  "the coordinator's status warns when its count would be partial",
   async () => {
     const h = host({ threads: [thread("here")] });
     await start(h, "here");
@@ -376,7 +399,10 @@ NodeTest.test(
       {},
       client("coordinator-1"),
     );
-    NodeAssert.equal(result.data, null);
+    NodeAssert.deepEqual(result.data, {
+      label: "Partial scan · Open Overview",
+      tone: "warning",
+    });
   },
 );
 
@@ -597,3 +623,208 @@ NodeTest.test(
     );
   },
 );
+
+const crossProjectHost = (options = {}) => {
+  const h = host({
+    projects: [
+      { id: "p", title: "Coordinator repo" },
+      { id: "q", title: "Worker repo" },
+      { id: "r", title: "Restricted repo" },
+    ],
+    threads: [
+      thread("c"),
+      thread("cq", { projectId: "q" }),
+      thread("launched", {
+        projectId: "q",
+        launchedFrom: { threadId: "c" },
+        isRunning: true,
+      }),
+      delegated("direct", "c", { projectId: "q", needsAttention: true }),
+      delegated("nested", "direct", { projectId: "q", isRunning: true }),
+      thread("unrelated", { projectId: "q" }),
+      thread("restricted", {
+        projectId: "r",
+        launchedFrom: { threadId: "c" },
+        needsAttention: true,
+      }),
+      thread("archived", {
+        projectId: "q",
+        launchedFrom: { threadId: "c" },
+        archivedAt: "2026-10-25T01:00:00Z",
+      }),
+    ],
+    ...options,
+  });
+  h.state.storage.set("coordinators.v1", {
+    version: 1,
+    projects: { p: { threadId: "c" }, q: { threadId: "cq" } },
+  });
+  h.state.deniedProjects.add("r");
+  return h;
+};
+
+NodeTest.test("Overview and status follow a cross-project worker's launcher, with live scoped counts", async () => {
+  const h = crossProjectHost();
+  for (const id of ["c", "launched", "direct"]) {
+    const { data } = await h.invoke("view:overview:read", {}, client(id));
+    NodeAssert.equal(data.project, "Coordinator repo");
+    NodeAssert.deepEqual(data.coordinator, { threadId: "c" });
+    NodeAssert.equal(data.current, id);
+    NodeAssert.deepEqual(data.scan, { complete: true });
+    NodeAssert.deepEqual(data.overview.groups.map((g) => [g.id, g.threads]), [
+      ["waiting", [{ threadId: "direct", title: "direct", projectId: "q", project: "Worker repo" }]],
+      ["working", [{ threadId: "launched", title: "launched", projectId: "q", project: "Worker repo" }]],
+    ]);
+    NodeAssert.deepEqual((await h.invoke("status:overview", {}, client(id))).data, {
+      label: "Accessible: 1 waiting on you", tone: "warning",
+    });
+  }
+  h.state.threads.get("direct").needsAttention = false;
+  h.state.threads.get("direct").settledOverride = "settled";
+  NodeAssert.equal((await h.invoke("status:overview", {}, client("launched"))).data.label,
+    "Accessible: 1 working");
+  NodeAssert.equal((await h.invoke("status:overview", {}, client("nested"))).data, null);
+  NodeAssert.ok(!h.state.threadLists.includes("r"));
+});
+
+NodeTest.test("Projects scans worker projects without coordinators and places cross-project workers once", async () => {
+  for (const exclusive of [false, true]) {
+    const h = crossProjectHost({ capabilities: [
+      "ui.native-tree-conversations", ...(exclusive ? ["ui.native-tree-projects"] : []),
+    ] });
+    delete h.state.storage.get("coordinators.v1").projects.q;
+    const { nodes } = await h.tree();
+    const coordinator = nodes.find((n) => n.threadId === "c");
+    for (const id of ["launched", "direct"]) {
+      const rows = nodes.filter((n) => n.threadId === id);
+      NodeAssert.equal(rows.length, 1, `${id} appears once`);
+      NodeAssert.equal(rows[0].parentId, coordinator.id);
+    }
+    NodeAssert.ok(!nodes.some((n) => n.threadId === "restricted" || n.projectId === "r"));
+    NodeAssert.equal(nodes.some((n) => n.threadId === "unrelated"), !exclusive);
+    NodeAssert.ok(!h.state.threadLists.includes("r"));
+  }
+});
+
+NodeTest.test("workers of two coordinators stay under their launcher across project sections", async () => {
+  const h = crossProjectHost({ capabilities: ["ui.native-tree-conversations", "ui.native-tree-projects"] });
+  h.state.threads.set("reverse", thread("reverse", { launchedFrom: { threadId: "cq" } }));
+  const { nodes } = await h.tree();
+  for (const [id, parent] of [["launched", "c"], ["direct", "c"], ["reverse", "cq"]]) {
+    const rows = nodes.filter((n) => n.threadId === id);
+    NodeAssert.equal(rows.length, 1);
+    NodeAssert.equal(rows[0].parentId, nodes.find((n) => n.threadId === parent).id);
+  }
+  const ids = nodes.filter((n) => n.threadId).map((n) => n.threadId);
+  NodeAssert.equal(new Set(ids).size, ids.length);
+});
+
+NodeTest.test("worker Overview edits the same coordinator memory it displays; agent memory stays local", async () => {
+  const h = crossProjectHost();
+  const { data } = await h.invoke("view:overview:remember", { text: "Coordinator decision" }, client("launched"));
+  for (const id of ["c", "launched"])
+    NodeAssert.deepEqual((await h.invoke("view:overview:read", {}, client(id))).data.notes, data.notes);
+  NodeAssert.deepEqual((await h.invoke("action:memory-read", {}, agent("launched"))).data.notes, []);
+  await h.invoke("view:overview:forget", { id: data.notes[0].id }, client("launched"));
+  NodeAssert.deepEqual((await h.invoke("view:overview:read", {}, client("c"))).data.notes, []);
+});
+
+NodeTest.test("a denied launcher is not replaced by the worker project's unrelated coordinator", async () => {
+  const h = crossProjectHost();
+  const added = await h.invoke("view:overview:remember", { text: "Restricted coordinator memory" }, client("c"));
+  h.state.deniedProjects.add("p");
+  NodeAssert.equal((await h.invoke("status:overview", {}, client("launched"))).data, null);
+  const { data } = await h.invoke("view:overview:read", {}, client("launched"));
+  NodeAssert.equal(data.coordinator, null);
+  NodeAssert.deepEqual(data.notes, []);
+  await h.invoke("view:overview:forget", { id: added.data.notes[0].id }, client("launched"));
+  h.state.deniedProjects.delete("p");
+  NodeAssert.deepEqual((await h.invoke("view:overview:read", {}, client("c"))).data.notes, added.data.notes);
+  h.state.deniedProjects.add("p");
+  const { nodes } = await h.tree();
+  NodeAssert.ok(!nodes.some((n) => n.threadId === "c" || n.projectId === "p"));
+});
+
+NodeTest.test("a failed accessible-project scan exposes partial groups without claiming exact totals", async () => {
+  const h = crossProjectHost();
+  h.state.failedProjects.add("q");
+  const { data } = await h.invoke("view:overview:read", {}, client("c"));
+  NodeAssert.deepEqual(data.scan, { complete: false });
+  NodeAssert.deepEqual(data.overview.groups, []);
+  NodeAssert.deepEqual((await h.invoke("status:overview", {}, client("c"))).data, {
+    label: "Partial scan · Open Overview", tone: "warning",
+  });
+});
+
+NodeTest.test("project pagination and project-list failures are reflected in scan completeness", async () => {
+  const h = crossProjectHost({ projectPageSize: 1 });
+  let result = await h.invoke("view:overview:read", {}, client("c"));
+  NodeAssert.deepEqual(result.data.scan, { complete: true });
+  NodeAssert.equal(result.data.overview.groups.length, 2);
+  h.state.projectListingFailsAt = 1;
+  result = await h.invoke("view:overview:read", {}, client("c"));
+  NodeAssert.deepEqual(result.data.scan, { complete: false });
+  NodeAssert.deepEqual((await h.invoke("status:overview", {}, client("c"))).data, {
+    label: "Partial scan · Open Overview", tone: "warning",
+  });
+});
+
+NodeTest.test("Overview and status scans have a total call bound across many granted projects", async () => {
+  const projects = Array.from({ length: 120 }, (_, i) => ({ id: `p${i}`, title: `P${i}` }));
+  const h = host({ projects, threads: [thread("c", { projectId: "p0" })] });
+  h.state.storage.set("coordinators.v1", { version: 1, projects: { p0: { threadId: "c" } } });
+  for (const name of ["view:overview:read", "status:overview"]) {
+    const calls = h.state.calls;
+    const { data } = await h.invoke(name, {}, client("c"));
+    NodeAssert.ok(h.state.calls - calls <= 80);
+    if (name.startsWith("view")) NodeAssert.deepEqual(data.scan, { complete: false });
+    else NodeAssert.equal(data.label, "Partial scan · Open Overview");
+  }
+});
+
+NodeTest.test("the panel shows working projects, accessible scope, partial counts and the launcher link", async () => {
+  const html = NodeFs.readFileSync(new URL("../views/overview.html", import.meta.url), "utf8");
+  const element = () => ({
+    children: [], hidden: false, textContent: "", attributes: {}, listeners: {},
+    append(...nodes) { this.children.push(...nodes); },
+    replaceChildren(...nodes) { this.children = nodes; },
+    setAttribute(key, value) { this.attributes[key] = value; },
+    addEventListener(key, handler) { this.listeners[key] = handler; },
+  });
+  const text = (node) => [node.textContent, ...node.children.map(text)].join(" ");
+  const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(([, id]) => [id, element()]));
+  const h = crossProjectHost();
+  let refresh;
+  const intents = [];
+  NodeVm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+    document: {
+      getElementById: (id) => elements.get(id),
+      createElement: element, createElementNS: element, addEventListener() {},
+    },
+    window: { t3: {
+      invoke: (name, input) => h.invoke(`view:overview:${name}`, input, client("launched")),
+      onContext: (handler) => { refresh = handler; },
+      intent: async (intent) => { intents.push(intent); },
+    } },
+  });
+  await refresh();
+  NodeAssert.equal(elements.get("name").textContent, "Coordinator repo");
+  NodeAssert.match(text(elements.get("groups")), /Worker repo/);
+  NodeAssert.match(html.match(/id="scope">([^<]+)/)[1], /accessible projects/i);
+  NodeAssert.equal(elements.get("threads").hidden, false);
+  NodeAssert.equal(elements.get("partial").hidden, true);
+  NodeAssert.equal(elements.get("back").hidden, false);
+  elements.get("back").listeners.click();
+  NodeAssert.equal(intents[0].threadId, "c");
+
+  h.state.failedProjects.add("p");
+  await refresh();
+  NodeAssert.equal(elements.get("partial").hidden, false);
+  NodeAssert.match(elements.get("summary").textContent, /partial/i);
+  NodeAssert.match(text(elements.get("groups")), /1\+/);
+  NodeAssert.equal(elements.get("no-threads").hidden, true);
+  h.state.failedProjects.add("q");
+  await refresh();
+  NodeAssert.equal(elements.get("no-threads").hidden, true);
+  NodeAssert.equal(elements.get("partial").hidden, false);
+});
