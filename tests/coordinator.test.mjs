@@ -409,3 +409,21 @@ NodeTest.test(
     NodeAssert.ok(!nodes.some((n) => n.threadId?.endsWith("-other")));
   },
 );
+
+NodeTest.test("workers left out of a section don't count towards its Done fold", () => {
+  const settled = (id, projectId, createdAt) =>
+    thread(id, {
+      projectId,
+      createdAt,
+      launchedFrom: { threadId: "c" },
+      settledOverride: "settled",
+    });
+  const threads = [
+    thread("c"),
+    settled("local", "p", "2026-10-01T00:00:00Z"),
+    ...[1, 2, 3, 4, 5].map((n) => settled(`far-${n}`, "q", `2026-10-0${n + 1}T00:00:00Z`)),
+  ];
+  const section = projectSection("p", threads, "c", Date.now(), { crossProject: false });
+  NodeAssert.deepEqual(section.workers.map((t) => t.id), ["local"]);
+  NodeAssert.deepEqual(section.done, []);
+});
