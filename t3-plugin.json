@@ -64,7 +64,7 @@
     {
       "id": "ask-project",
       "title": "Ask another project",
-      "description": "From a project's main conversation, send work or a question to another project's coordinator instead of starting a worker there. Input: {projectId, message} (up to 4000 characters; projectId from t3_project_list). If the person has to add the project first, T3 shows them a card and the message goes out when they approve. Then end your turn: the reply arrives in this conversation. Reuse the operationId when retrying.",
+      "description": "From a project's main conversation, send work or a question to another project's coordinator instead of starting a worker there. Input: {projectId, message} (up to 4000 characters; projectId from t3_project_list). If the person has to add the project first, T3 shows them a card and the message goes out when they approve. Then end your turn: the reply arrives in this conversation. Each project can ask another 10 times an hour. Reuse the operationId when retrying.",
       "placements": [],
       "agentCallable": true
     },

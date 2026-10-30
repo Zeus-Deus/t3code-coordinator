@@ -5,6 +5,7 @@ import {
   appendNote,
   askedRow,
   askMessage,
+  askQuotaSpent,
   BRIEF,
   buildTree,
   CONVERSATION_BRIEF,
@@ -26,6 +27,7 @@ import {
   overviewSummary,
   projectSection,
   putHandoff,
+  recordAsk,
   repeatedAsk,
   replyMessage,
 } from "./lib/coordinator.mjs";
@@ -496,6 +498,13 @@ export function activate(ctx) {
       const digest = hashId(text);
       const store = await readHandoffs();
       const repeated = repeatedAsk(store, { id, digest, projectId });
+      // A retry of a counted ask isn't a new one, so it still goes through.
+      if (!repeated && askQuotaSpent(store, from.projectId, projectId))
+        return {
+          message:
+            "This project has already asked that project 10 times in the last hour, so nothing was sent. Stop here and tell the person.",
+          data: { status: "limited" },
+        };
       if (repeated?.status === "sent")
         return {
           message:
@@ -542,7 +551,10 @@ export function activate(ctx) {
         status: "pending",
         text,
       };
-      await saveHandoff(handoff);
+      await ctx.storage.set(
+        HANDOFFS,
+        repeated ? putHandoff(store, handoff) : recordAsk(store, handoff),
+      );
       await invalidate(HANDOFF_TOPICS);
       // The row is the agent's result, so it exists from the first call and follows the handoff.
       const row = async () => {

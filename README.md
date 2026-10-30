@@ -47,6 +47,8 @@ needs a build that can ask for a project from a conversation; older builds refus
 - **Agents** can read the playbook and the project memory through `t3_plugin_invoke`, using the
   `guide`, `memory-read` and `memory-append` actions. Project coordinators reach each other with
   `ask-project` and `reply-project`.
+- **Asks are limited** to 10 an hour in each direction between two projects, so two coordinators
+  can't keep each other going. Past that, nothing is sent and the coordinator tells you.
 - **Not now** on a project card sends nothing, and T3 won't ask about that project again until you
   next write in that conversation.
 - **Removing the plugin's access** to a project takes it out of the Overview; rows already in a

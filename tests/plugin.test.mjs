@@ -41,9 +41,10 @@ function host({
   threads = [],
   capabilities = [],
   projectPageSize = 200,
+  storage = new Map(),
 } = {}) {
   const state = {
-    storage: new Map(),
+    storage,
     threads: new Map(threads.map((t) => [t.id, t])),
     created: [],
     unarchived: [],
@@ -1298,11 +1299,94 @@ NodeTest.test("a full store refuses a new ask rather than lose a reply route", a
   NodeAssert.ok(!stored.some((entry) => entry.id === handoffId));
 });
 
+NodeTest.test("each direction between two projects gets 10 new asks an hour", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-30T12:00:00Z") });
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((c) => c.projectId === "r");
+  const { target } = await delivered(h);
+  for (let i = 1; i < 10; i++) await ask(h, { message: `Ask ${i}.` });
+  NodeAssert.equal(asked(h).length, 10);
+
+  const before = h.state.accessRequests.length;
+  const invocation = agent("coordinator-1", "over");
+  const over = await ask(h, { message: "Eleven." }, invocation);
+  NodeAssert.equal(over.data.status, "limited");
+  NodeAssert.match(over.message, /nothing was sent/);
+  NodeAssert.match(over.message, /Stop here and tell the person/);
+  NodeAssert.equal(over.card, undefined);
+  NodeAssert.equal(asked(h).length, 10);
+  NodeAssert.equal(h.state.accessRequests.length, before);
+  const count = () => h.state.storage.get("handoffs.v1").handoffs.length;
+  NodeAssert.equal(count(), 10);
+
+  // The other direction and another target have their own count.
+  await ask(h, { projectId: "p", message: "Back." }, agent(target));
+  await ask(h, { projectId: "q", message: "From Harbor." }, agent(harbor.id));
+  NodeAssert.equal(asked(h).length, 12);
+  await ask(h, { projectId: "r", message: "To Harbor." });
+  NodeAssert.equal(asked(h).length, 13);
+
+  // The person writing here doesn't reset it, and a reload keeps it.
+  h.state.threads.get("coordinator-1").latestUserAuthoredMessageAt = new Date().toISOString();
+  const reloaded = host({
+    projects: [
+      { id: "p", title: "Shelf" },
+      { id: "q", title: "Atlas" },
+      { id: "r", title: "Harbor" },
+    ],
+    capabilities: HANDOFF_CAPABILITIES,
+    threads: [...h.state.threads.values()],
+    storage: h.state.storage,
+  });
+  const again = await ask(reloaded, { message: "Twelve." });
+  NodeAssert.equal(again.data.status, "limited");
+  NodeAssert.equal(asked(reloaded).length, 0);
+
+  t.mock.timers.tick(3_600_000);
+  const later = await ask(reloaded, { message: "An hour on." });
+  NodeAssert.equal(later.data.status, "sent");
+  NodeAssert.equal(asked(reloaded).length, 1);
+  // Old entries fall away rather than pile up.
+  const { recentAsks } = reloaded.state.storage.get("handoffs.v1");
+  NodeAssert.ok(recentAsks.every((entry) => Date.now() - entry.at < 3_600_000));
+});
+
+NodeTest.test("a retry of a counted ask isn't a new one", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-30T12:00:00Z") });
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  const invocation = agent("coordinator-1", "tenth");
+  for (let i = 1; i < 10; i++) await ask(h, { message: `Ask ${i}.` });
+  await ask(h, { message: "Ten." }, invocation);
+  const retry = await ask(h, { message: "Ten." }, invocation);
+  NodeAssert.match(retry.message, /already went out/);
+  NodeAssert.equal(asked(h).length, 10);
+});
+
+NodeTest.test("121 alternating asks stop at the bound with no person involved", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-30T12:00:00Z") });
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  await h.invoke("action:reply-project", { handoffId, message: "Ok." }, agent(target));
+  for (let i = 0; i < 120; i++)
+    await ask(
+      h,
+      i % 2
+        ? { message: `Turn ${i}.` }
+        : { projectId: "p", message: `Turn ${i}.` },
+      agent(i % 2 ? "coordinator-1" : target),
+    );
+  const between = asked(h).filter((m) => /^Turn|health check/.test(m.text));
+  NodeAssert.equal(between.length, 20);
+});
+
 NodeTest.test("waiting messages are bounded", async () => {
   const h = await askingHost();
+  h.state.deniedProjects.add("r");
   for (let i = 0; i < 10; i++) await ask(h, { message: `Message ${i}.` });
   await NodeAssert.rejects(
-    ask(h, { message: "One too many." }),
+    ask(h, { projectId: "r", message: "One too many." }),
     /Too many messages/,
   );
 });
