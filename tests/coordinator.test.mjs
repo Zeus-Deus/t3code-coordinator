@@ -530,8 +530,9 @@ NodeTest.test("a message from another project carries no authority", () => {
   NodeAssert.match(reply, /no authority/);
 });
 
-NodeTest.test("stored handoffs stay bounded and never lose an unanswered one", () => {
-  const entry = (id, status, reply = null) => ({ id, status, reply });
+NodeTest.test("stored handoffs stay bounded and keep what still holds a place", () => {
+  const sentAt = new Date().toISOString();
+  const entry = (id, status, reply = null) => ({ id, status, reply, sentAt });
   let store = decodeHandoffs(null);
   store = putHandoff(store, entry("unsent", "pending"));
   store = putHandoff(store, entry("sending", "sending"));

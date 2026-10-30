@@ -1785,6 +1785,176 @@ NodeTest.test("121 alternating asks stop at the bound with no person involved", 
   NodeAssert.equal(between.length, 20);
 });
 
+const DAY = 86_400_000;
+const NOON = Date.parse("2026-10-30T12:00:00Z");
+/** Asks to ids the host stores but no card ever shows for. */
+async function fillWithBadIds(h) {
+  for (let i = 0; i < 10; i++) {
+    h.state.deniedProjects.add(`bad-${i}`);
+    await ask(h, { projectId: `bad-${i}`, message: `Bad id ${i}.` });
+  }
+}
+
+NodeTest.test("ten bad ids clear themselves after a day, and the agent hears once", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  await fillWithBadIds(h);
+  const blocked = await ask(h);
+  NodeAssert.equal(blocked.data.status, "limited");
+  NodeAssert.match(blocked.message, /tell the person they can discard asks in the Overview/);
+  NodeAssert.doesNotMatch(blocked.message, /\bcards?\b/);
+  NodeAssert.deepEqual(asked(h), []);
+
+  t.mock.timers.tick(DAY);
+  const after = await ask(h);
+  NodeAssert.equal(after.data.status, "sent");
+  NodeAssert.match(after.message, /10 asks of yours expired after a day/);
+  NodeAssert.match(after.message, /"Bad id 9\."/);
+  // One line, on a result it was already reading: no message wakes it.
+  NodeAssert.doesNotMatch(after.message.split("Sent.")[1], /\n/);
+  NodeAssert.deepEqual(notes(h), []);
+  const quiet = await ask(h, { message: "And another." });
+  NodeAssert.doesNotMatch(quiet.message, /expired/);
+});
+
+NodeTest.test("the expired note also reaches a call that's refused", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  h.state.deniedProjects.add("bad");
+  await ask(h, { projectId: "bad", message: "Lost." });
+  t.mock.timers.tick(DAY - 60_000);
+  for (let i = 0; i < 10; i++) await ask(h, { message: `Ask ${i}.` });
+  t.mock.timers.tick(60_000);
+  const refused = await ask(h, { message: "Eleven." });
+  NodeAssert.equal(refused.data.status, "limited");
+  NodeAssert.match(refused.message, /An ask of yours expired after a day/);
+});
+
+NodeTest.test("an ask under a day old stays, and a late approval doesn't send an expired one", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  const { card } = await ask(h);
+  t.mock.timers.tick(DAY - 1);
+  await ask(h, { projectId: "r", message: "Hello." });
+  NodeAssert.equal((await row(h, card.data.handoffId)).label, "Waiting for access");
+  t.mock.timers.tick(1);
+  await answer(h, "granted");
+  NodeAssert.equal(asked(h).filter((m) => /health check/.test(m.text)).length, 0);
+  NodeAssert.equal((await row(h, card.data.handoffId)).label, "Expired");
+  NodeAssert.deepEqual((await panel(h)).others.filter((o) => o.project === "Atlas"), []);
+});
+
+NodeTest.test("a person's action and a reply also expire old asks", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const stale = (h) => h.state.storage.get("handoffs.v1").handoffs.find((e) => e.to.projectId === "bad");
+  const h = await askingHost();
+  h.state.deniedProjects.add("bad");
+  await ask(h, { projectId: "bad", message: "Lost." });
+  t.mock.timers.tick(DAY);
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(stale(h).status, "expired");
+
+  const other = await askingHost();
+  other.state.deniedProjects.add("bad");
+  const { handoffId, target } = await delivered(other);
+  await ask(other, { projectId: "bad", message: "Lost." });
+  t.mock.timers.tick(DAY);
+  await other.invoke("action:reply-project", { handoffId, message: "Done." }, agent(target));
+  NodeAssert.equal(stale(other).status, "expired");
+});
+
+NodeTest.test("the same operationId after expiry asks again, with a fresh day", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "again");
+  await ask(h, {}, invocation);
+  t.mock.timers.tick(DAY);
+  await ask(h, { projectId: "r", message: "Hello." });
+  const again = await ask(h, {}, invocation);
+  NodeAssert.equal(again.data.status, "pending");
+  t.mock.timers.tick(DAY - 1);
+  await answer(h, "granted");
+  NodeAssert.equal(asked(h).filter((m) => /health check/.test(m.text)).length, 1);
+});
+
+NodeTest.test("expiry leaves a send of unknown outcome alone", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  await lostAfterSend(h);
+  h.state.readError = new Error("The host is busy.");
+  t.mock.timers.tick(7 * DAY);
+  await ask(h, { message: "Much later." });
+  const [first] = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(first.status, "sending");
+  NodeAssert.equal((await panel(h)).others[0].state, "undelivered");
+});
+
+NodeTest.test("the undelivered limit is per asking conversation", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((c) => c.projectId === "r");
+  await fillWithBadIds(h);
+  NodeAssert.equal((await ask(h)).data.status, "limited");
+  const elsewhere = await ask(h, { message: "From Harbor." }, agent(harbor.id));
+  NodeAssert.equal(elsewhere.data.status, "sent");
+});
+
+NodeTest.test("unanswered asks stop holding a place after a week", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  const store = h.state.storage.get("handoffs.v1");
+  const [first] = store.handoffs;
+  for (let i = 1; i < 100; i++)
+    store.handoffs.push({ ...first, id: `unanswered-${i}` });
+  t.mock.timers.tick(7 * DAY - 1);
+  const refused = await ask(h, { message: "Too soon." });
+  NodeAssert.match(refused.message, /tell the person they can discard asks in the Overview/);
+  t.mock.timers.tick(1);
+  const stored = () => h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(stored().length, 100);
+  // Still a working route after the week, until something needs its place.
+  const sent = await ask(h, { message: "After the week." });
+  NodeAssert.equal(sent.data.status, "sent");
+  NodeAssert.equal(stored().length, 100);
+  NodeAssert.ok(!stored().some((entry) => entry.id === handoffId));
+  await NodeAssert.rejects(
+    h.invoke("action:reply-project", { handoffId, message: "Late." }, agent(target)),
+    /no ask with that handoffId/,
+  );
+});
+
+NodeTest.test("an over-quota call delivers nothing, and no note promised it would", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  for (let i = 0; i < 10; i++) await ask(h, { message: `Ask ${i}.` });
+  h.state.createError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.createError = null;
+  NodeAssert.match(notes(h)[0].text, /retried with your next accepted ask-project/);
+  NodeAssert.doesNotMatch(notes(h)[0].text, /goes out with your next/);
+
+  const over = await ask(h, { message: "Eleven." });
+  NodeAssert.equal(over.data.status, "limited");
+  NodeAssert.match(over.message, /asked that project 10 times/);
+  NodeAssert.deepEqual(asked(h), []);
+  // A refusal by the undelivered limit isn't a dead end: the backlog filling it gets its retry.
+  const capped = await ask(h, { projectId: "r", message: "Hello." });
+  NodeAssert.equal(capped.data.status, "limited");
+  NodeAssert.match(capped.message, /this one wasn't sent/);
+  NodeAssert.equal(asked(h).length, 10);
+});
+
+NodeTest.test("the quota message states the limit in force", () => {
+  const source = NodeFs.readFileSync(new URL("../plugin.mjs", import.meta.url), "utf8");
+  NodeAssert.match(source, /asked that project \$\{HANDOFF_LIMITS\.asksPerHour\} times/);
+});
+
 NodeTest.test("waiting messages are bounded", async () => {
   const h = await askingHost();
   h.state.deniedProjects.add("r");
@@ -1792,7 +1962,7 @@ NodeTest.test("waiting messages are bounded", async () => {
   const hostRequests = h.state.accessRequests.length;
   const refused = await ask(h, { projectId: "r", message: "One too many." });
   NodeAssert.equal(refused.data.status, "limited");
-  NodeAssert.match(refused.message, /Too many messages/);
+  NodeAssert.match(refused.message, /Too many asks from this conversation/);
   // The host never hears of it, so it can't push a real card out of its 64.
   NodeAssert.equal(h.state.accessRequests.length, hostRequests);
   NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 10);

@@ -14,14 +14,15 @@ import {
   decodeCoordinators,
   decodeHandoffs,
   decodeMemory,
+  expireHandoffs,
   GUIDE,
   HANDOFF_LIMITS,
   handoffText,
   hashId,
   isProjectConversation,
-  isUnanswered,
   isUndelivered,
   isWorker,
+  keepsPlace,
   memoryKey,
   messagePreview,
   noteText,
@@ -34,6 +35,7 @@ import {
   repeatedAsk,
   replyMarker,
   replyMessage,
+  takeExpiredNote,
 } from "./lib/coordinator.mjs";
 
 const COORDINATORS = "coordinators.v1";
@@ -60,6 +62,8 @@ const HANDOFF_TOPICS = [...TOPICS, `view:${ASKED}`];
 // The hidden action the host runs when a person answers its project card.
 const ACCESS_ANSWER = "project-access";
 // Opening never guesses: these cases leave the choice to the person.
+const DISCARD_HINT =
+  "Stop here and tell the person they can discard asks in the Overview.";
 const UNCONFIRMED =
   "Couldn't check whether it already arrived, so it wasn't sent again.";
 const PROBLEMS = {
@@ -92,6 +96,26 @@ export function activate(ctx) {
     decodeHandoffs(await ctx.storage.get(HANDOFFS));
   const saveHandoff = async (handoff) =>
     ctx.storage.set(HANDOFFS, putHandoff(await readHandoffs(), handoff));
+  /** Housekeeping: a failure here must not get in the way of what the caller came to do. */
+  const pruneStored = async () => {
+    try {
+      const store = await readHandoffs();
+      const pruned = expireHandoffs(store);
+      if (pruned !== store) await ctx.storage.set(HANDOFFS, pruned);
+    } catch (error) {
+      ctx.log("warn", `Could not expire old asks: ${error?.message}`);
+    }
+  };
+  /** Noted once, on a result the agent is already reading, so an expiry never wakes it. */
+  const expiredNote = async (threadId) => {
+    try {
+      const { store, note } = takeExpiredNote(await readHandoffs(), threadId);
+      if (note) await ctx.storage.set(HANDOFFS, store);
+      return note;
+    } catch {
+      return "";
+    }
+  };
 
   const listThreads = async (projectId, invocation, budget) => {
     const threads = new Map();
@@ -487,7 +511,7 @@ export function activate(ctx) {
   };
 
   const unsentNote = (problem) =>
-    `Your message to another project hasn't gone out: ${problem} It is kept and goes out with your next ask-project or reply-project. To send it now, call ask-project again with the same projectId, message and operationId once that's sorted.`;
+    `Your message to another project hasn't gone out: ${problem} It is kept and retried with your next accepted ask-project or reply-project. To send it now, call ask-project again with the same projectId, message and operationId once that's sorted.`;
 
   /** The same, for a result the agent reads. */
   const retryNote = async (threadId, invocation, skipProjectId) => {
@@ -521,6 +545,7 @@ export function activate(ctx) {
       invocation,
     );
     if (problem) return { message: PROBLEMS[problem] };
+    await serial(pruneStored);
     // A person acting in the conversation can send on its behalf; the agent hears if that fails.
     if (context.threadId === threadId) {
       const [failed] = await serial(() => retryAsks(threadId, invocation));
@@ -571,6 +596,123 @@ export function activate(ctx) {
     };
   });
 
+  const askProject = async (from, projectId, text, invocation) => {
+    // Agents reuse the operation id when retrying, so the same call never sends a second message.
+    const id = hashId(from.id, invocation.operationId).slice(0, 16);
+    const digest = hashId(text);
+    const store = await readHandoffs();
+    const repeated = repeatedAsk(store, { id, digest, projectId });
+    if (!repeated && askUsedRecently(store, id))
+      return {
+        message:
+          "That operationId was already used and its ask is gone, so nothing was sent. If it still matters, use a new operationId.",
+        data: { status: "used" },
+      };
+    // A retry of a counted ask isn't a new one, so it still goes through.
+    if (!repeated && askQuotaSpent(store, from.projectId, projectId))
+      return {
+        message: `This project has already asked that project ${HANDOFF_LIMITS.asksPerHour} times in the last hour, so nothing was sent. Stop here and tell the person.`,
+        data: { status: "limited" },
+      };
+    if (repeated?.status === "sent")
+      return {
+        message: `That message already went out. Its reply arrives in this conversation; end your turn.${await retryNote(from.id, invocation)}`,
+        data: { handoffId: repeated.id, status: "sent" },
+      };
+    // Before the host hears of it: past 64 requests it drops its oldest unanswered one, so an ask
+    // refused here must not cost a real card its place.
+    if (
+      (!repeated || !isUndelivered(repeated)) &&
+      store.handoffs.filter(
+        (entry) => isUndelivered(entry) && entry.from.threadId === from.id,
+      ).length >= HANDOFF_LIMITS.pending
+    )
+      return {
+        // The backlog that fills this limit may be ready to go, so it still gets its retry.
+        message: `Too many asks from this conversation are waiting to go out, so this one wasn't sent. ${DISCARD_HINT}${await retryNote(from.id, invocation)}`,
+        data: { status: "limited" },
+      };
+    if (
+      !repeated &&
+      store.handoffs.filter((entry) => keepsPlace(entry)).length >=
+        HANDOFF_LIMITS.handoffs
+    )
+      return {
+        message: `Too many asks are still unanswered, so nothing was sent. ${DISCARD_HINT}`,
+        data: { status: "limited" },
+      };
+    const { status } = await ctx.projects.requestAccess({
+      projectId,
+      threadId: from.id,
+      actionId: ACCESS_ANSWER,
+    });
+    if (status === "declined") {
+      if (repeated?.status === "pending")
+        await saveHandoff({ ...repeated, status: "declined", text: "" });
+      return {
+        message: `The person said not now to this project, so nothing was sent. Tell them plainly. You can ask again once they next write here.${await retryNote(from.id, invocation, projectId)}`,
+        data: { status },
+      };
+    }
+    const handoff = {
+      id,
+      digest,
+      from: { threadId: from.id, projectId: from.projectId },
+      to: { projectId, threadId: null },
+      reply: null,
+      ...repeated,
+      // Asking again after it expired or was declined starts its day over.
+      createdAt:
+        repeated && isUndelivered(repeated)
+          ? repeated.createdAt
+          : new Date().toISOString(),
+      status: repeated?.status === "sending" ? "sending" : "pending",
+      noted: false,
+      text,
+    };
+    await ctx.storage.set(
+      HANDOFFS,
+      repeated ? putHandoff(store, handoff) : recordAsk(store, handoff),
+    );
+    await invalidate(HANDOFF_TOPICS);
+    // The row is the agent's result, so it exists from the first call and follows the handoff.
+    const row = async () => {
+      if (repeated) return {};
+      const { projects } = await listProjects(invocation, { calls: 2 });
+      return {
+        card: {
+          viewId: ASKED,
+          summary: `Asked ${projects.get(projectId)?.title ?? "another project"}`,
+          data: { handoffId: handoff.id },
+        },
+      };
+    };
+    if (status === "pending")
+      return {
+        message: `The person needs to add this project first; T3 shows them a card here. The message is kept and goes out when they approve. Tell them plainly which project you need and why, then end your turn.${await retryNote(from.id, invocation, projectId)}`,
+        data: { handoffId: handoff.id, status },
+        ...(await row()),
+      };
+    const problem = await deliverAsks(from.id, projectId, invocation);
+    const others = await retryNote(from.id, invocation, projectId);
+    await invalidate(HANDOFF_TOPICS);
+    // The problem may be an older attempt's, which this ask went past.
+    const sent = (await readHandoffs()).handoffs.some(
+      (entry) => entry.id === handoff.id && entry.status === "sent",
+    );
+    return {
+      message: [
+        sent && "Sent. The reply arrives in this conversation; end your turn.",
+        problem && unsentNote(problem),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .concat(others),
+      data: { handoffId: handoff.id, status: sent ? "sent" : "pending" },
+      ...(await row()),
+    };
+  };
+
   ctx.handle("action:ask-project", (input, invocation) =>
     serial(async () => {
       const { caller } = invocation;
@@ -589,113 +731,11 @@ export function activate(ctx) {
         throw new Error("Name the project with its id from t3_project_list.");
       if (projectId === from.projectId)
         throw new Error("That is this project. Delegate the work instead.");
-      // Agents reuse the operation id when retrying, so the same call never sends a second message.
-      const id = hashId(from.id, invocation.operationId).slice(0, 16);
-      const digest = hashId(text);
-      const store = await readHandoffs();
-      const repeated = repeatedAsk(store, { id, digest, projectId });
-      if (!repeated && askUsedRecently(store, id))
-        return {
-          message:
-            "That operationId was already used and its ask is gone, so nothing was sent. If it still matters, use a new operationId.",
-          data: { status: "used" },
-        };
-      // A retry of a counted ask isn't a new one, so it still goes through.
-      if (!repeated && askQuotaSpent(store, from.projectId, projectId))
-        return {
-          message:
-            "This project has already asked that project 10 times in the last hour, so nothing was sent. Stop here and tell the person.",
-          data: { status: "limited" },
-        };
-      if (repeated?.status === "sent")
-        return {
-          message: `That message already went out. Its reply arrives in this conversation; end your turn.${await retryNote(from.id, invocation)}`,
-          data: { handoffId: repeated.id, status: "sent" },
-        };
-      // Before the host hears of it: past 64 requests it drops its oldest unanswered one, so an ask
-      // refused here must not cost a real card its place.
-      if (
-        (!repeated || !isUndelivered(repeated)) &&
-        store.handoffs.filter(isUndelivered).length >= HANDOFF_LIMITS.pending
-      )
-        return {
-          message:
-            "Too many messages are waiting to go out. Ask the person to answer the project cards first.",
-          data: { status: "limited" },
-        };
-      if (
-        !repeated &&
-        store.handoffs.filter(isUnanswered).length >= HANDOFF_LIMITS.handoffs
-      )
-        return {
-          message:
-            "Too many asks are still unanswered, so nothing was sent. Stop here and tell the person.",
-          data: { status: "limited" },
-        };
-      const { status } = await ctx.projects.requestAccess({
-        projectId,
-        threadId: from.id,
-        actionId: ACCESS_ANSWER,
-      });
-      if (status === "declined") {
-        if (repeated?.status === "pending")
-          await saveHandoff({ ...repeated, status: "declined", text: "" });
-        return {
-          message: `The person said not now to this project, so nothing was sent. Tell them plainly. You can ask again once they next write here.${await retryNote(from.id, invocation, projectId)}`,
-          data: { status },
-        };
-      }
-      const handoff = {
-        id,
-        digest,
-        from: { threadId: from.id, projectId: from.projectId },
-        to: { projectId, threadId: null },
-        reply: null,
-        createdAt: new Date().toISOString(),
-        ...repeated,
-        status: repeated?.status === "sending" ? "sending" : "pending",
-        text,
-      };
-      await ctx.storage.set(
-        HANDOFFS,
-        repeated ? putHandoff(store, handoff) : recordAsk(store, handoff),
-      );
-      await invalidate(HANDOFF_TOPICS);
-      // The row is the agent's result, so it exists from the first call and follows the handoff.
-      const row = async () => {
-        if (repeated) return {};
-        const { projects } = await listProjects(invocation, { calls: 2 });
-        return {
-          card: {
-            viewId: ASKED,
-            summary: `Asked ${projects.get(projectId)?.title ?? "another project"}`,
-            data: { handoffId: handoff.id },
-          },
-        };
-      };
-      if (status === "pending")
-        return {
-          message: `The person needs to add this project first; T3 shows them a card here. The message is kept and goes out when they approve. Tell them plainly which project you need and why, then end your turn.${await retryNote(from.id, invocation, projectId)}`,
-          data: { handoffId: handoff.id, status },
-          ...(await row()),
-        };
-      const problem = await deliverAsks(from.id, projectId, invocation);
-      const others = await retryNote(from.id, invocation, projectId);
-      await invalidate(HANDOFF_TOPICS);
-      // The problem may be an older attempt's, which this ask went past.
-      const sent = (await readHandoffs()).handoffs.some(
-        (entry) => entry.id === handoff.id && entry.status === "sent",
-      );
+      await pruneStored();
+      const result = await askProject(from, projectId, text, invocation);
       return {
-        message: [
-          sent && "Sent. The reply arrives in this conversation; end your turn.",
-          problem && unsentNote(problem),
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .concat(others),
-        data: { handoffId: handoff.id, status: sent ? "sent" : "pending" },
-        ...(await row()),
+        ...result,
+        message: `${result.message}${await expiredNote(from.id)}`,
       };
     }),
   );
@@ -706,6 +746,7 @@ export function activate(ctx) {
     serial(async () => {
       const { projectId, threadId } = invocation.context ?? {};
       if (!projectId || !threadId) return {};
+      await pruneStored();
       try {
         const { status } = await ctx.projects.requestAccess({
           projectId,
@@ -754,6 +795,7 @@ export function activate(ctx) {
       if (caller.kind !== "agent" || !caller.threadId)
         throw new Error("Replies come from a project's main conversation.");
       const text = handoffText(input?.message);
+      await pruneStored();
       // Only a stored handoff addressed to this conversation says where a reply may go. A target
       // is set just before the first send, so a reply also proves an unconfirmed send arrived.
       const handoff = (await readHandoffs()).handoffs.find(
