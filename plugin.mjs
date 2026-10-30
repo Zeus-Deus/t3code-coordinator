@@ -499,12 +499,15 @@ export function activate(ctx) {
     const coordinatorIds = new Set(
       sections.flatMap((s) => (s.coordinator ? [s.coordinator.id] : [])),
     );
+    // Only a conversation heading may hold another project's thread, so without one a worker
+    // stays in its own project: the host would reject the whole tree otherwise.
+    const nests = (section, t) =>
+      !coordinatorIds.has(t.id) &&
+      (conversations() || t.projectId === section.projectId);
     const placed = new Set();
     for (const section of sections) {
-      section.workers = section.workers.filter(
-        (t) => !coordinatorIds.has(t.id),
-      );
-      section.done = section.done.filter((t) => !coordinatorIds.has(t.id));
+      section.workers = section.workers.filter((t) => nests(section, t));
+      section.done = section.done.filter((t) => nests(section, t));
       for (const thread of [...section.workers, ...section.done])
         placed.add(thread.id);
     }

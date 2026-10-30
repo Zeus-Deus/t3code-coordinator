@@ -736,6 +736,17 @@ NodeTest.test("Projects scans worker projects without coordinators and places cr
   }
 });
 
+NodeTest.test("without conversation headings a cross-project worker stays in its own project", async () => {
+  const h = crossProjectHost();
+  delete h.state.storage.get("coordinators.v1").projects.q;
+  const { nodes } = await h.tree();
+  const heading = (id) => nodes.find((n) => n.kind === "project" && n.projectId === id);
+  NodeAssert.ok(!nodes.some((n) => n.kind === "project" && n.threadId));
+  const launched = nodes.filter((n) => n.threadId === "launched");
+  NodeAssert.deepEqual(launched.map((n) => n.parentId), [heading("q").id]);
+  NodeAssert.ok(!nodes.some((n) => n.threadId === "direct"));
+});
+
 NodeTest.test("workers of two coordinators stay under their launcher across project sections", async () => {
   const h = crossProjectHost({ capabilities: ["ui.native-tree-conversations", "ui.native-tree-projects"] });
   h.state.threads.set("reverse", thread("reverse", { launchedFrom: { threadId: "cq" } }));
