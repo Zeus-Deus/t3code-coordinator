@@ -585,6 +585,26 @@ export function activate(ctx) {
           message: `That message already went out. Its reply arrives in this conversation; end your turn.${await retryNote(from.id, invocation)}`,
           data: { handoffId: repeated.id, status: "sent" },
         };
+      // Before the host hears of it: past 64 requests it drops its oldest unanswered one, so an ask
+      // refused here must not cost a real card its place.
+      if (
+        (!repeated || !isUndelivered(repeated)) &&
+        store.handoffs.filter(isUndelivered).length >= HANDOFF_LIMITS.pending
+      )
+        return {
+          message:
+            "Too many messages are waiting to go out. Ask the person to answer the project cards first.",
+          data: { status: "limited" },
+        };
+      if (
+        !repeated &&
+        store.handoffs.filter(isUnanswered).length >= HANDOFF_LIMITS.handoffs
+      )
+        return {
+          message:
+            "Too many asks are still unanswered, so nothing was sent. Stop here and tell the person.",
+          data: { status: "limited" },
+        };
       const { status } = await ctx.projects.requestAccess({
         projectId,
         threadId: from.id,
@@ -598,20 +618,6 @@ export function activate(ctx) {
           data: { status },
         };
       }
-      if (
-        !repeated &&
-        store.handoffs.filter(isUndelivered).length >= HANDOFF_LIMITS.pending
-      )
-        throw new Error(
-          "Too many messages are waiting to go out. Ask the person to answer the project cards first.",
-        );
-      if (
-        !repeated &&
-        store.handoffs.filter(isUnanswered).length >= HANDOFF_LIMITS.handoffs
-      )
-        throw new Error(
-          "Too many asks are still unanswered, so nothing was sent. Stop here and tell the person.",
-        );
       const handoff = {
         id,
         digest,

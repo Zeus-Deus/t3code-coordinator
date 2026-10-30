@@ -1625,8 +1625,9 @@ NodeTest.test("a full store refuses a new ask rather than lose a reply route", a
   const [first] = store.handoffs;
   for (let i = 1; i < 100; i++)
     store.handoffs.push({ ...first, id: `unanswered-${i}` });
-  const refused = ask(h, { message: "One more." });
-  await NodeAssert.rejects(refused, /still unanswered, so nothing was sent/);
+  const refused = await ask(h, { message: "One more." });
+  NodeAssert.equal(refused.data.status, "limited");
+  NodeAssert.match(refused.message, /still unanswered, so nothing was sent/);
   NodeAssert.equal(asked(h).length, 1);
   NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 100);
   // The oldest route still works, and its reply frees a place.
@@ -1724,10 +1725,13 @@ NodeTest.test("waiting messages are bounded", async () => {
   const h = await askingHost();
   h.state.deniedProjects.add("r");
   for (let i = 0; i < 10; i++) await ask(h, { message: `Message ${i}.` });
-  await NodeAssert.rejects(
-    ask(h, { projectId: "r", message: "One too many." }),
-    /Too many messages/,
-  );
+  const hostRequests = h.state.accessRequests.length;
+  const refused = await ask(h, { projectId: "r", message: "One too many." });
+  NodeAssert.equal(refused.data.status, "limited");
+  NodeAssert.match(refused.message, /Too many messages/);
+  // The host never hears of it, so it can't push a real card out of its 64.
+  NodeAssert.equal(h.state.accessRequests.length, hostRequests);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 10);
 });
 
 NodeTest.test(
