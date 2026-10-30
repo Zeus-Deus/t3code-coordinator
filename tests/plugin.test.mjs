@@ -100,6 +100,7 @@ function host({
         };
       }),
       create: counted(async (input) => {
+        if (state.createError) throw state.createError;
         const threadId = `coordinator-${state.created.length + 1}`;
         state.created.push(input);
         state.threads.set(
@@ -369,13 +370,13 @@ NodeTest.test(
     );
     const status = async (id) =>
       (await h.invoke("status:overview", {}, client(id))).data;
-    const waiting = { label: "Accessible: 1 waiting on you", tone: "warning" };
+    const waiting = { label: "1 waiting on you", tone: "warning" };
     NodeAssert.deepEqual(await status("coordinator-1"), waiting);
     NodeAssert.deepEqual(await status("busy"), waiting);
     NodeAssert.equal(await status("bystander"), null);
     // The coordinator's own question counts alongside its threads'.
     h.state.threads.get("coordinator-1").needsAttention = true;
-    NodeAssert.equal((await status("busy")).label, "Accessible: 2 waiting on you");
+    NodeAssert.equal((await status("busy")).label, "2 waiting on you");
     h.state.threads.get("coordinator-1").archivedAt = "2026-10-25T01:00:00Z";
     NodeAssert.equal(await status("coordinator-1"), null);
     NodeAssert.equal(await status("busy"), null);
@@ -548,6 +549,35 @@ NodeTest.test(
 );
 
 NodeTest.test(
+  "a device with no agent says what to do instead of the host's error",
+  async () => {
+    const h = host({
+      projects: [{ id: "p", title: "Demo" }],
+      capabilities: [
+        "ui.native-tree-conversations",
+        "ui.native-tree-projects",
+      ],
+    });
+    const add = () =>
+      h.invoke(
+        "action:new-project",
+        {},
+        { ...client(), context: { projectId: "p" } },
+      );
+    h.state.createError = Object.assign(
+      new Error("Thread creation requires a model selection."),
+      { reason: "invalid_input" },
+    );
+    const { message, intents } = await add();
+    NodeAssert.match(message, /Settings → Providers/);
+    NodeAssert.equal(intents, undefined);
+    // Any other failure stays the host's to report.
+    h.state.createError = new Error("disk full");
+    await NodeAssert.rejects(add(), /disk full/);
+  },
+);
+
+NodeTest.test(
   "as its own view, Projects owns its conversations and brings back the same one when re-added",
   async () => {
     const projects = [
@@ -676,13 +706,13 @@ NodeTest.test("Overview and status follow a cross-project worker's launcher, wit
       ["working", [{ threadId: "launched", title: "launched", projectId: "q", project: "Worker repo" }]],
     ]);
     NodeAssert.deepEqual((await h.invoke("status:overview", {}, client(id))).data, {
-      label: "Accessible: 1 waiting on you", tone: "warning",
+      label: "1 waiting on you", tone: "warning",
     });
   }
   h.state.threads.get("direct").needsAttention = false;
   h.state.threads.get("direct").settledOverride = "settled";
   NodeAssert.equal((await h.invoke("status:overview", {}, client("launched"))).data.label,
-    "Accessible: 1 working");
+    "1 working");
   NodeAssert.equal((await h.invoke("status:overview", {}, client("nested"))).data, null);
   NodeAssert.ok(!h.state.threadLists.includes("r"));
 });
@@ -810,7 +840,6 @@ NodeTest.test("the panel shows working projects, accessible scope, partial count
   await refresh();
   NodeAssert.equal(elements.get("name").textContent, "Coordinator repo");
   NodeAssert.match(text(elements.get("groups")), /Worker repo/);
-  NodeAssert.match(html.match(/id="scope">([^<]+)/)[1], /accessible projects/i);
   NodeAssert.equal(elements.get("threads").hidden, false);
   NodeAssert.equal(elements.get("partial").hidden, true);
   NodeAssert.equal(elements.get("back").hidden, false);

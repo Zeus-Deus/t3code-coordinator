@@ -41,6 +41,8 @@ const PROBLEMS = {
     "This project has more than one conversation. Open the one you want from Settings → Archive.",
   archived:
     "This project's conversation is archived. Restore it from Settings → Archive.",
+  noAgent:
+    "No agent is ready on this device. Sign in to one in Settings → Providers, then choose this project again.",
 };
 
 export function activate(ctx) {
@@ -167,13 +169,13 @@ export function activate(ctx) {
   const overviewContext = async (invocation) => {
     const thread = await contextThread(invocation);
     const store = await readCoordinators();
-    const launcher = Object.entries(store.projects).find(
-      ([, coordinator]) => isWorker(thread, coordinator.threadId),
+    const launcher = Object.entries(store.projects).find(([, coordinator]) =>
+      isWorker(thread, coordinator.threadId),
     );
     const projectId =
       store.projects[thread.projectId]?.threadId === thread.id
         ? thread.projectId
-        : launcher?.[0] ?? thread.projectId;
+        : (launcher?.[0] ?? thread.projectId);
     const coordinator = await liveCoordinator(projectId, store);
     // Stored ids do not grant access to another project's memory after its grant is revoked.
     return {
@@ -284,26 +286,36 @@ export function activate(ctx) {
       }
       // A plan-mode source thread would otherwise make the coordinator and its workers plan-only.
       const common = { projectId, interactionMode: "default" };
-      const { threadId } = conversations()
-        ? // The project heading is this conversation, so it carries the project's name and starts
-          // empty: the brief rides along with the person's first message instead of a run now.
-          await ctx.threads.create({
-            ...common,
-            title:
-              (await listProjects(invocation, { calls: 2 })).projects.get(
-                projectId,
-              )?.title ?? "Project",
-            brief: CONVERSATION_BRIEF,
-            ...(projectsView() ? { owner: OWNER } : {}),
-            idempotencyKey: "open-conversation",
-          })
-        : await ctx.threads.create({
-            ...common,
-            // The breadcrumb already names the project: "Shelf / Coordinator".
-            title: "Coordinator",
-            text: BRIEF,
-            idempotencyKey: "start-coordinator",
-          });
+      const create = async () =>
+        conversations()
+          ? // The project heading is this conversation, so it carries the project's name and starts
+            // empty: the brief rides along with the person's first message instead of a run now.
+            await ctx.threads.create({
+              ...common,
+              title:
+                (await listProjects(invocation, { calls: 2 })).projects.get(
+                  projectId,
+                )?.title ?? "Project",
+              brief: CONVERSATION_BRIEF,
+              ...(projectsView() ? { owner: OWNER } : {}),
+              idempotencyKey: "open-conversation",
+            })
+          : await ctx.threads.create({
+              ...common,
+              // The breadcrumb already names the project: "Shelf / Coordinator".
+              title: "Coordinator",
+              text: BRIEF,
+              idempotencyKey: "start-coordinator",
+            });
+      let threadId;
+      try {
+        ({ threadId } = await create());
+      } catch (error) {
+        // A device without a signed-in agent has no model to give a new thread.
+        if (error?.reason === "invalid_input" && /model/i.test(error.message))
+          return { problem: "noAgent" };
+        throw error;
+      }
       await remember(projectId, threadId);
       await invalidate(TOPICS);
       return { threadId, created: true };
@@ -383,7 +395,8 @@ export function activate(ctx) {
   });
 
   ctx.handle(`view:${VIEW}:read`, async (_input, invocation) => {
-    const { thread, projectId, coordinator } = await overviewContext(invocation);
+    const { thread, projectId, coordinator } =
+      await overviewContext(invocation);
     const [{ notes }, scan] = await Promise.all([
       readMemory(projectId),
       coordinator
@@ -434,7 +447,8 @@ export function activate(ctx) {
   // Like Claude Code Projects' Overview button, the chip is the same on the coordinator and on
   // every thread it started, so the Overview is one click away wherever the person is.
   ctx.handle(`status:${VIEW}`, async (_input, invocation) => {
-    const { thread, projectId, coordinator } = await overviewContext(invocation);
+    const { thread, projectId, coordinator } =
+      await overviewContext(invocation);
     if (!coordinator || thread.archivedAt) return { data: null };
     const coordinatorId = coordinator.id;
     if (thread.id !== coordinatorId && !isWorker(thread, coordinatorId))
@@ -444,17 +458,13 @@ export function activate(ctx) {
     ]);
     // Pages follow thread ids, not activity, so a partial count could hide running work.
     if (!scan.complete)
-      return { data: { label: "Partial scan · Open Overview", tone: "warning" } };
+      return {
+        data: { label: "Partial scan · Open Overview", tone: "warning" },
+      };
     const listedCoordinator = scan.threads.find((t) => t.id === coordinatorId);
-    if (!listedCoordinator || listedCoordinator.archivedAt) return { data: null };
-    const status = overview(scan.threads, coordinatorId).status;
-    const label = status.label.replace("ready for review", "ready");
-    return {
-      data: {
-        ...status,
-        label: `Accessible: ${label}`.slice(0, 40),
-      },
-    };
+    if (!listedCoordinator || listedCoordinator.archivedAt)
+      return { data: null };
+    return { data: overview(scan.threads, coordinatorId).status };
   });
 
   ctx.trees.register(TREE, async (invocation) => {
@@ -491,7 +501,9 @@ export function activate(ctx) {
     );
     const placed = new Set();
     for (const section of sections) {
-      section.workers = section.workers.filter((t) => !coordinatorIds.has(t.id));
+      section.workers = section.workers.filter(
+        (t) => !coordinatorIds.has(t.id),
+      );
       section.done = section.done.filter((t) => !coordinatorIds.has(t.id));
       for (const thread of [...section.workers, ...section.done])
         placed.add(thread.id);
