@@ -642,3 +642,18 @@ NodeTest.test("an unconfirmed ask gives up its place after a week", () => {
   NodeAssert.equal(handoffs.length, 100);
   NodeAssert.ok(handoffs.some((entry) => entry.id === "new"));
 });
+
+NodeTest.test("an evicted open ask can't be sent again by a late retry", () => {
+  const at = Date.parse("2026-10-30T00:00:00Z");
+  const full = Array.from({ length: 100 }, (_, n) =>
+    openAsk({ id: `old-${n}`, status: "sending" }),
+  );
+  const store = putHandoff(
+    { ...decodeHandoffs(null), handoffs: full },
+    openAsk({ id: "new", createdAt: "2026-10-30T00:00:00Z" }),
+    at,
+  );
+  NodeAssert.ok(!store.handoffs.some((entry) => entry.id === "old-0"));
+  NodeAssert.ok(askUsedRecently(store, "old-0", at + 86_400_000));
+  NodeAssert.ok(!askUsedRecently(store, "new", at));
+});

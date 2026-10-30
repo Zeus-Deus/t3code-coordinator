@@ -1298,6 +1298,20 @@ NodeTest.test("the same fault is safe through every retry path", async () => {
   NodeAssert.equal(asked(other).filter((m) => /health check/.test(m.text)).length, 1);
 });
 
+NodeTest.test("an ask past its week isn't retried with a later delivery", async () => {
+  const h = await askingHost();
+  await lostAfterSend(h, agent("coordinator-1", "aged"));
+  const [aged] = h.state.storage.get("handoffs.v1").handoffs;
+  aged.createdAt = new Date(Date.now() - 8 * 86_400_000).toISOString();
+  // It never arrived, so a retry would have sent it.
+  h.state.sent.length = 0;
+  h.state.messages.clear();
+  const later = await ask(h, { message: "A later ask." });
+  NodeAssert.equal(later.data.status, "sent");
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.match(asked(h)[0].text, /^A later ask\./);
+});
+
 NodeTest.test("an attempt of unknown outcome doesn't hold up later asks", async () => {
   const h = await askingHost();
   const invocation = agent("coordinator-1", "unknown-first");

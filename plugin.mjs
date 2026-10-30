@@ -441,8 +441,10 @@ export function activate(ctx) {
     try {
       const { handoffs } = await readHandoffs();
       for (const handoff of handoffs) {
+        // Past `keepsPlace` an ask is outside the cap, so it can't join a delivery's call budget.
         if (
           !isUndelivered(handoff) ||
+          !keepsPlace(handoff) ||
           handoff.from.threadId !== threadId ||
           handoff.to.projectId !== projectId
         )
@@ -492,6 +494,7 @@ export function activate(ctx) {
       const waiting = (await readHandoffs()).handoffs.filter(
         (entry) =>
           isUndelivered(entry) &&
+          keepsPlace(entry) &&
           entry.from.threadId === threadId &&
           entry.to.projectId !== skipProjectId,
       );
