@@ -65,6 +65,7 @@ function host({
     messages: new Map(),
     reads: [],
     statusesAtSend: [],
+    statusesAtReply: [],
     handler: null,
     caller: null,
     contextThreadId: null,
@@ -181,6 +182,11 @@ function host({
         };
       }),
       send: counted(async (input) => {
+        state.statusesAtReply.push(
+          ...(state.storage.get("handoffs.v1")?.handoffs ?? [])
+            .filter((entry) => input.idempotencyKey === `reply-${entry.id}`)
+            .map((entry) => entry.reply?.status),
+        );
         state.statusesAtSend.push(
           ...(state.storage.get("handoffs.v1")?.handoffs ?? [])
             .filter((entry) => entry.id && input.idempotencyKey === `ask-${entry.id}`)
@@ -1829,6 +1835,93 @@ NodeTest.test(
     NodeAssert.equal(asked(h).length, 2);
   },
 );
+
+/** A reply the host took, whose outcome the plugin never saved. */
+async function lostReply(h) {
+  const { handoffId, target } = await delivered(h);
+  const invocation = agent(target, "lost-reply");
+  const reply = { handoffId, message: "It's done." };
+  h.state.crashAfterSend = true;
+  await NodeAssert.rejects(
+    h.invoke("action:reply-project", reply, invocation),
+    /The process died/,
+  );
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].reply.status, "sending");
+  return { target, invocation, reply };
+}
+const replies = (h) => asked(h).filter((m) => m.threadId === "coordinator-1");
+
+NodeTest.test("a reply is saved as sending before the send", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  await h.invoke("action:reply-project", { handoffId, message: "Done." }, agent(target));
+  NodeAssert.deepEqual(h.state.statusesAtReply, ["sending"]);
+  const [stored] = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(stored.reply.status, undefined);
+  NodeAssert.deepEqual(h.state.reads, []);
+  NodeAssert.match(replies(h)[0].text, new RegExp(`reply to handoff "${handoffId}"`));
+});
+
+NodeTest.test("a fault between a reply's send and save doesn't send it twice", async () => {
+  const h = await askingHost();
+  const { target, invocation, reply } = await lostReply(h);
+  // Unconfirmed, so nothing claims the answer has arrived.
+  NodeAssert.equal((await panel(h)).others[0].state, "sent");
+  NodeAssert.equal((await panel(h)).others[0].preview, "Please add a health check.");
+  const retry = await h.invoke("action:reply-project", reply, invocation);
+  NodeAssert.match(retry.message, /Reply sent/);
+  NodeAssert.deepEqual(h.state.reads, ["coordinator-1"]);
+  NodeAssert.equal(replies(h).length, 1);
+  NodeAssert.equal((await panel(h)).others[0].state, "replied");
+  // A new operationId with the same words is the same attempt, not a second reply.
+  await NodeAssert.rejects(
+    h.invoke("action:reply-project", reply, agent(target)),
+    /Each ask gets one reply/,
+  );
+});
+
+NodeTest.test("a new operationId retries a reply of unknown outcome, once", async () => {
+  const h = await askingHost();
+  const { target, reply } = await lostReply(h);
+  await h.invoke("action:reply-project", reply, agent(target));
+  NodeAssert.equal(replies(h).length, 1);
+});
+
+NodeTest.test("a reply that never left goes out on the retry", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  const invocation = agent(target, "unsent-reply");
+  const reply = { handoffId, message: "Done." };
+  h.state.sendError = new Error("The host is busy.");
+  await NodeAssert.rejects(h.invoke("action:reply-project", reply, invocation), /busy/);
+  h.state.sendError = null;
+  await h.invoke("action:reply-project", reply, invocation);
+  NodeAssert.equal(replies(h).length, 1);
+  NodeAssert.equal(h.state.reads.length, 1);
+});
+
+NodeTest.test("if the asker can't be read, a reply isn't sent again", async () => {
+  const h = await askingHost();
+  const { invocation, reply } = await lostReply(h);
+  h.state.readError = new Error("The host is busy.");
+  const blocked = await h.invoke("action:reply-project", reply, invocation);
+  NodeAssert.match(blocked.message, /wasn't sent again/);
+  NodeAssert.equal(replies(h).length, 1);
+  h.state.readError = null;
+  const retry = await h.invoke("action:reply-project", reply, invocation);
+  NodeAssert.match(retry.message, /Reply sent/);
+  NodeAssert.equal(replies(h).length, 1);
+});
+
+NodeTest.test("a different reply can't replace one of unknown outcome", async () => {
+  const h = await askingHost();
+  const { invocation, reply } = await lostReply(h);
+  await NodeAssert.rejects(
+    h.invoke("action:reply-project", { ...reply, message: "Something else." }, invocation),
+    /different reply/,
+  );
+  NodeAssert.equal(replies(h).length, 1);
+});
 
 NodeTest.test(
   "a reply is refused without a stored handoff addressed to the caller",

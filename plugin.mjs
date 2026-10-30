@@ -32,6 +32,7 @@ import {
   putHandoff,
   recordAsk,
   repeatedAsk,
+  replyMarker,
   replyMessage,
 } from "./lib/coordinator.mjs";
 
@@ -765,33 +766,42 @@ export function activate(ctx) {
         );
       const id = hashId(caller.threadId, invocation.operationId).slice(0, 16);
       const digest = hashId(text);
-      if (handoff.reply?.id === id && handoff.reply.digest === digest)
+      const { reply } = handoff;
+      const unconfirmed = reply?.status === "sending";
+      if (reply?.id === id && reply.digest === digest && !unconfirmed)
         return { message: "That reply already went out." };
-      if (handoff.reply?.id === id)
+      if (reply?.id === id && reply.digest !== digest)
         throw new Error(
           "This operationId already sent a different reply. Use a new operationId.",
         );
-      if (handoff.reply)
+      if (reply && (!unconfirmed || reply.digest !== digest))
         throw new Error(
           "You already replied to this ask. Each ask gets one reply.",
         );
-      await ctx.threads.send({
-        threadId: handoff.from.threadId,
-        text: replyMessage(text),
-        fromConversation: true,
-        idempotencyKey: `reply-${handoff.id}`,
-      });
-      await saveHandoff({
+      const at = new Date().toISOString();
+      const attempt = {
         ...handoff,
         status: "sent",
         text: messagePreview(handoff.text),
-        sentAt: handoff.sentAt ?? new Date().toISOString(),
-        reply: {
-          id,
-          digest,
-          text: messagePreview(text),
-          at: new Date().toISOString(),
-        },
+        sentAt: handoff.sentAt ?? at,
+        reply: { id, digest, text, status: "sending", at },
+      };
+      const sent = await sendOnce({
+        unconfirmed,
+        begin: () => saveHandoff(attempt),
+        marker: replyMarker(handoff.id),
+        threadId: handoff.from.threadId,
+        text: replyMessage(text, handoff.id),
+        idempotencyKey: `reply-${handoff.id}`,
+      });
+      if (!sent)
+        return {
+          message:
+            "Couldn't check whether your reply already arrived, so it wasn't sent again. Try once more with the same message.",
+        };
+      await saveHandoff({
+        ...attempt,
+        reply: { id, digest, text: messagePreview(text), at },
       });
       const others = await retryNote(caller.threadId, invocation);
       await invalidate(HANDOFF_TOPICS);
