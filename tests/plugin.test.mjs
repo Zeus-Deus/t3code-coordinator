@@ -450,7 +450,12 @@ NodeTest.test(
       (match) => match[1],
     );
     const h = host();
-    NodeAssert.deepEqual(names.toSorted(), ["forget", "read", "remember"]);
+    NodeAssert.deepEqual(names.toSorted(), [
+      "discard",
+      "forget",
+      "read",
+      "remember",
+    ]);
     for (const name of names) {
       // The client bridge prefixes `view:<id>:` itself and rejects any other shape.
       NodeAssert.match(name, /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/);
@@ -1499,7 +1504,7 @@ NodeTest.test("the next ask-project delivers a stranded ask, once and in order",
     asked(h).map((m) => m.text.split("\n")[0]),
     ["Hello Harbor.", "Please add a health check.", "Hello again."],
   );
-  NodeAssert.equal((await panel(h)).others.find((o) => o.projectId === "q").state, "sent");
+  NodeAssert.equal((await panel(h)).others.find((o) => o.project === "Atlas").state, "sent");
 });
 
 NodeTest.test("the next reply delivers a stranded ask", async () => {
@@ -2204,12 +2209,106 @@ NodeTest.test(
   },
 );
 
-NodeTest.test("a pending ask has no name to show, so the Overview waits for it", async () => {
+const shown = (row) => `${row.project} ${row.preview}`;
+
+NodeTest.test("an ask waiting for access shows without saying anything about the project", async () => {
   const h = await askingHost();
   await ask(h);
   const data = await panel(h);
-  NodeAssert.deepEqual(data.others, []);
+  NodeAssert.equal(data.others.length, 1);
+  NodeAssert.equal(shown(data.others[0]), "Another project · Waiting for access");
+  NodeAssert.equal(data.others[0].discardable, true);
+  NodeAssert.equal(data.others[0].threadId, null);
+  NodeAssert.deepEqual(data.others[0].history, [
+    { who: "Waiting for access", text: "Please add a health check." },
+  ]);
   NodeAssert.equal(data.summary, "No workers yet");
+  // Not the name, and not the id the agent gave either.
+  NodeAssert.doesNotMatch(JSON.stringify(data.others), /Atlas|"q"/);
+});
+
+NodeTest.test("a person can discard an ask waiting for access", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "to-discard");
+  await ask(h, {}, invocation);
+  const requests = h.state.accessRequests.length;
+  const sends = h.state.sent.length;
+  const [{ key }] = (await panel(h)).others;
+  await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  NodeAssert.deepEqual((await panel(h)).others, []);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 0);
+  NodeAssert.ok(h.state.invalidated.includes("view:asked"));
+  // Storage only: nothing is sent and the host hears nothing.
+  NodeAssert.equal(h.state.sent.length, sends);
+  NodeAssert.equal(h.state.accessRequests.length, requests);
+  // The agent can't bring it back by retrying.
+  const replay = await ask(h, {}, invocation);
+  NodeAssert.equal(replay.data.status, "used");
+  await answer(h, "granted");
+  NodeAssert.deepEqual(asked(h), []);
+});
+
+NodeTest.test("discarding the bad ids frees a blocked conversation at once", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  await fillWithBadIds(h);
+  NodeAssert.equal((await ask(h)).data.status, "limited");
+  const rows = (await panel(h)).others;
+  NodeAssert.equal(rows.length, 10);
+  NodeAssert.ok(rows.every((row) => shown(row) === "Another project · Waiting for access"));
+  for (const { key } of rows)
+    await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  NodeAssert.equal((await ask(h)).data.status, "sent");
+});
+
+NodeTest.test("a discarded sent ask refuses a reply, and an answered one stays", async () => {
+  const h = await askingHost();
+  const first = await delivered(h);
+  await h.invoke(
+    "action:reply-project",
+    { handoffId: first.handoffId, message: "Done." },
+    agent(first.target),
+  );
+  NodeAssert.equal((await panel(h)).others[0].discardable, false);
+  const second = await ask(h, { message: "One more." });
+  NodeAssert.equal((await panel(h)).others[0].discardable, true);
+  const [{ key }] = (await panel(h)).others;
+  await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  const stored = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.deepEqual(stored.map((entry) => entry.id), [first.handoffId]);
+  await NodeAssert.rejects(
+    h.invoke(
+      "action:reply-project",
+      { handoffId: second.data.handoffId, message: "Late." },
+      agent(first.target),
+    ),
+    /no ask with that handoffId/,
+  );
+  NodeAssert.equal((await panel(h)).others[0].state, "replied");
+});
+
+NodeTest.test("a person can discard a send of unknown outcome, however old", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  await lostAfterSend(h);
+  h.state.readError = new Error("The host is busy.");
+  t.mock.timers.tick(30 * DAY);
+  const [{ key, discardable }] = (await panel(h)).others;
+  NodeAssert.equal(discardable, true);
+  await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 0);
+});
+
+NodeTest.test("only the asking project's panel can discard its asks", async () => {
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((c) => c.projectId === "r");
+  await ask(h);
+  const [{ key }] = (await panel(h)).others;
+  await h.invoke("view:overview:discard", { key }, client(harbor.id));
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 1);
+  await h.invoke("view:overview:discard", { key: "made-up" }, client("coordinator-1"));
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 1);
 });
 
 NodeTest.test("the subtitle stays short with several projects", async () => {
@@ -2224,12 +2323,15 @@ NodeTest.test("the subtitle stays short with several projects", async () => {
   );
 });
 
-NodeTest.test("revoking a project drops it from the Overview and neutralises its row", async () => {
+NodeTest.test("revoking a project neutralises its rows, which can still be cleared", async () => {
   const h = await askingHost();
   const { handoffId } = await delivered(h);
   h.state.deniedProjects.add("q");
   const data = await panel(h);
-  NodeAssert.deepEqual(data.others, []);
+  NodeAssert.equal(data.others.length, 1);
+  NodeAssert.equal(shown(data.others[0]), "Another project · No access");
+  NodeAssert.deepEqual(data.others[0].history, []);
+  NodeAssert.equal(data.others[0].discardable, true);
   NodeAssert.equal(data.summary, "No workers yet");
   NodeAssert.deepEqual(await row(h, handoffId), {
     title: "Asked another project",
@@ -2238,6 +2340,14 @@ NodeTest.test("revoking a project drops it from the Overview and neutralises its
     label: "No access",
   });
   NodeAssert.doesNotMatch(JSON.stringify(data), /Atlas|health check/);
+});
+
+NodeTest.test("revoked asks that were answered drop out entirely", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  await h.invoke("action:reply-project", { handoffId, message: "Done." }, agent(target));
+  h.state.deniedProjects.add("q");
+  NodeAssert.deepEqual((await panel(h)).others, []);
 });
 
 NodeTest.test("a deleted target loses its link but keeps the history", async () => {
@@ -2335,11 +2445,26 @@ NodeTest.test("the Overview section is hidden when empty, and folds in place", a
   NodeAssert.match(expanded, /Asked: \s*Please add a health check\./);
   NodeAssert.match(expanded, /Atlas: \s*All done\./);
   NodeAssert.match(expanded, /Open Atlas ›/);
-  rows.children[1].children.at(-1).listeners.click();
+  NodeAssert.doesNotMatch(expanded, /Discard/);
+  const actions = rows.children[1].children.at(-1);
+  actions.children[0].listeners.click();
   NodeAssert.equal(intents[0].threadId, target);
 
   rows.children[0].listeners.click();
   NodeAssert.equal(rows.children.length, 1);
+
+  // An open ask adds a quiet Discard, which takes the row with it.
+  await ask(h, { projectId: "r", message: "Hello Harbor." });
+  await refresh();
+  const harbor = rows.children[0];
+  NodeAssert.match(text(harbor), /Harbor/);
+  harbor.listeners.click();
+  const row = rows.children[1].children.at(-1);
+  NodeAssert.deepEqual(row.children.map((node) => node.textContent), ["Open Harbor ›", "Discard"]);
+  row.children[1].listeners.click();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  NodeAssert.doesNotMatch(text(rows), /Harbor/);
 });
 
 NodeTest.test("the asked card reads its handoff and links to the conversation", async () => {
@@ -2353,12 +2478,14 @@ NodeTest.test("the asked card reads its handoff and links to the conversation", 
   const { handoffId, target } = await delivered(h);
   const intents = [];
   let invoked;
+  let changed;
   NodeVm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
     document: { getElementById: (id) => elements.get(id), addEventListener() {} },
     window: { t3: {
       context: { card: { summary: "Asked Atlas", data: { handoffId } } },
       invoke: (name, input) => (invoked = h.invoke(`view:asked:${name}`, input, client("coordinator-1"))),
       onContext() {},
+      onChanged: (handler) => { changed = handler; },
       intent: async (intent) => { intents.push(intent); },
     } },
   });
@@ -2372,6 +2499,17 @@ NodeTest.test("the asked card reads its handoff and links to the conversation", 
   NodeAssert.equal(intents[0].type, "thread.reveal");
   NodeAssert.equal(intents[0].threadId, target);
   NodeAssert.doesNotMatch(html, /<form/);
+
+  // Once discarded the row keeps only its recorded summary, with no status or link.
+  const [{ key }] = (await panel(h)).others;
+  await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  changed();
+  await invoked;
+  await new Promise(setImmediate);
+  NodeAssert.equal(elements.get("title").textContent, "Asked Atlas");
+  NodeAssert.equal(elements.get("status").textContent, "");
+  NodeAssert.equal(elements.get("row").disabled, true);
+  NodeAssert.equal(elements.get("chevron").hidden, true);
 });
 
 NodeTest.test("the manifest declares the handoff the host needs", () => {

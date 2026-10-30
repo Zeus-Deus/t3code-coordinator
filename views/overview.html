@@ -246,8 +246,11 @@
       .history .who {
         color: var(--fg);
       }
+      .history .actions {
+        display: flex;
+        gap: 12px;
+      }
       .history button {
-        align-self: flex-start;
         color: var(--muted);
       }
       .history button:hover {
@@ -517,7 +520,7 @@
           $("others").hidden = others.length === 0;
           $("others-count").textContent = String(others.length);
           others.forEach(function (other) {
-            var open = !!state.openProjects[other.projectId];
+            var open = !!state.openProjects[other.key];
             var row = el("button", "row");
             row.type = "button";
             row.setAttribute("aria-expanded", String(open));
@@ -528,7 +531,7 @@
               icon("chevron", "chevron"),
             );
             row.addEventListener("click", function () {
-              state.openProjects[other.projectId] = !open;
+              state.openProjects[other.key] = !open;
               renderOthers(others);
             });
             root.append(row);
@@ -542,14 +545,27 @@
               );
               history.append(item);
             });
+            var actions = el("div", "actions");
             if (other.threadId) {
               var link = el("button", "", "Open " + other.project + " ›");
               link.type = "button";
               link.addEventListener("click", function () {
                 reveal(other.threadId);
               });
-              history.append(link);
+              actions.append(link);
             }
+            if (other.discardable) {
+              var discard = el("button", "", "Discard");
+              discard.type = "button";
+              discard.addEventListener("click", function () {
+                discard.disabled = true;
+                call("discard", { key: other.key }).then(refresh, function () {
+                  discard.disabled = false;
+                });
+              });
+              actions.append(discard);
+            }
+            history.append(actions);
             root.append(history);
           });
         }

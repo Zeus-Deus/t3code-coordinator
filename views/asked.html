@@ -107,12 +107,13 @@
         };
         var data = null;
 
-        function render() {
-          $("title").textContent = data.title;
-          $("status").textContent = "· " + data.label;
-          $("status").className = data.state;
-          $("row").disabled = !data.threadId;
-          $("chevron").hidden = !data.threadId;
+        // A discarded or long-gone ask has nothing left to say beyond its recorded summary.
+        function render(card) {
+          $("title").textContent = data ? data.title : card.summary;
+          $("status").textContent = data ? "· " + data.label : "";
+          $("status").className = data ? data.state : "";
+          $("row").disabled = !data || !data.threadId;
+          $("chevron").hidden = !data || !data.threadId;
         }
 
         function refresh() {
@@ -122,9 +123,8 @@
           var id = card.data && card.data.handoffId;
           t3.invoke("read", { handoffId: id }).then(
             function (result) {
-              if (!result.data) return;
               data = result.data;
-              render();
+              render(card);
             },
             // The recorded summary stays readable, and the next signal tries again.
             function () {},

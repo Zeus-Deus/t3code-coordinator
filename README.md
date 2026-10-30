@@ -54,8 +54,9 @@ needs a build that can ask for a project from a conversation; older builds refus
 - **Removing the plugin's access** to a project takes it out of the Overview; rows already in a
   conversation stop naming it. The plugin keeps a short preview of up to 100 asks between projects,
   answered ones going first, and each conversation shows only its own.
-- **Nothing stays stuck.** An ask still waiting to go out expires after a day. An unanswered one
-  stops holding a place after a week, so newer asks can replace it.
+- **Nothing stays stuck.** Expand a project under **Other projects** and choose **Discard** to drop
+  its open asks. An ask still waiting to go out expires after a day, and an unanswered one stops
+  holding a place after a week, so newer asks can replace it.
 
 ## Development
 

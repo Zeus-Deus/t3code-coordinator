@@ -14,6 +14,7 @@ import {
   decodeCoordinators,
   decodeHandoffs,
   decodeMemory,
+  discardAsks,
   expireHandoffs,
   GUIDE,
   HANDOFF_LIMITS,
@@ -906,6 +907,22 @@ export function activate(ctx) {
         notes,
       },
     };
+  });
+
+  // A view can't send, so this only forgets. A reply to a discarded ask is refused.
+  ctx.handle(`view:${VIEW}:discard`, async (input, invocation) => {
+    const { thread, projectId, coordinator } =
+      await overviewContext(invocation);
+    if (coordinator && thread.projectId === projectId)
+      await serial(async () => {
+        await pruneStored();
+        await ctx.storage.set(
+          HANDOFFS,
+          discardAsks(await readHandoffs(), coordinator.id, input?.key),
+        );
+      });
+    await invalidate(HANDOFF_TOPICS);
+    return { data: null };
   });
 
   ctx.handle(`view:${VIEW}:remember`, async (input, invocation) => {
