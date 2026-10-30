@@ -58,6 +58,7 @@ function host({
     accessRequests: [],
     declinedProjects: new Set(),
     sendError: null,
+    accessError: null,
     handler: null,
     caller: null,
     contextThreadId: null,
@@ -174,6 +175,7 @@ function host({
       requestAccess: counted(async (request) => {
         if (!state.caller || state.handler?.startsWith("view:")) throw denied();
         if (!state.threads.get(request.threadId)?.pluginOwner) throw denied();
+        if (state.accessError) throw state.accessError;
         state.accessRequests.push(request);
         if (!state.deniedProjects.has(request.projectId))
           return { status: "granted" };
@@ -1149,7 +1151,10 @@ NodeTest.test(
     const first = await ask(h, {}, invocation);
     NodeAssert.equal(first.data.status, "pending");
     NodeAssert.match(first.message, /hasn't gone out/);
-    NodeAssert.equal((await row(h, first.data.handoffId)).label, "Not sent");
+    NodeAssert.equal(
+      (await row(h, first.data.handoffId)).label,
+      "Not delivered yet",
+    );
     h.state.sendError = null;
     const retry = await ask(h, {}, invocation);
     NodeAssert.equal(retry.data.status, "sent");
@@ -1178,6 +1183,143 @@ NodeTest.test(
     NodeAssert.equal(asked(h).length, 1);
   },
 );
+
+/** An approved ask the host failed to deliver: the grant stands, and it is still undelivered. */
+async function stranded(h) {
+  const { card } = await ask(h);
+  h.state.createError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.createError = null;
+  return card.data.handoffId;
+}
+
+NodeTest.test(
+  "a host failure in the approval callback leaves the ask pending, shown, and the agent told",
+  async () => {
+    const h = await askingHost();
+    const handoffId = await stranded(h);
+    NodeAssert.deepEqual(asked(h), []);
+    NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "pending");
+    NodeAssert.equal(notes(h).length, 1);
+    NodeAssert.equal(notes(h)[0].threadId, "coordinator-1");
+    NodeAssert.match(notes(h)[0].text, /hasn't gone out: The host is busy\./);
+
+    const [other] = (await panel(h)).others;
+    NodeAssert.equal(other.project, "Atlas");
+    NodeAssert.equal(other.state, "undelivered");
+    NodeAssert.equal(other.threadId, null);
+    NodeAssert.equal(other.preview, "Not delivered yet: Please add a health check.");
+    NodeAssert.deepEqual(other.history, [
+      { who: "Not delivered yet", text: "Please add a health check." },
+    ]);
+    NodeAssert.equal((await panel(h)).summary, "No workers yet");
+    NodeAssert.deepEqual(await row(h, handoffId), {
+      title: "Asked Atlas",
+      threadId: null,
+      state: "undelivered",
+      label: "Not delivered yet",
+    });
+  },
+);
+
+NodeTest.test("a failed access read in the callback is noted the same way", async () => {
+  const h = await askingHost();
+  await ask(h);
+  h.state.accessError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.accessError = null;
+  NodeAssert.equal(notes(h).length, 1);
+  NodeAssert.match(notes(h)[0].text, /hasn't gone out/);
+  await ask(h, { projectId: "r", message: "Hello." });
+  NodeAssert.ok(asked(h).some((m) => /health check/.test(m.text)));
+});
+
+NodeTest.test("reads never send a stranded ask", async () => {
+  const h = await askingHost();
+  const handoffId = await stranded(h);
+  await panel(h);
+  await row(h, handoffId);
+  await h.invoke("status:overview", {}, client("coordinator-1"));
+  await h.tree();
+  NodeAssert.deepEqual(asked(h), []);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "pending");
+});
+
+NodeTest.test("the next ask-project delivers a stranded ask, once and in order", async () => {
+  const h = await askingHost();
+  await stranded(h);
+  await ask(h, { projectId: "r", message: "Hello Harbor." });
+  await ask(h, { projectId: "r", message: "Hello again." });
+  NodeAssert.deepEqual(
+    asked(h).map((m) => m.text.split("\n")[0]),
+    ["Hello Harbor.", "Please add a health check.", "Hello again."],
+  );
+  NodeAssert.equal((await panel(h)).others.find((o) => o.projectId === "q").state, "sent");
+});
+
+NodeTest.test("the next reply delivers a stranded ask", async () => {
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((t) => t.projectId === "r");
+  const { data } = await ask(h, { projectId: "r", message: "Hello Harbor." });
+  await stranded(h);
+  NodeAssert.equal(asked(h).length, 1);
+  // Harbor answers Shelf's ask with its own ask to Atlas stuck behind a failure.
+  h.state.deniedProjects.add("q");
+  await ask(h, { projectId: "q", message: "From Harbor." }, agent(harbor.id));
+  h.state.deniedProjects.delete("q");
+  h.state.sendError = new Error("The host is busy.");
+  await answer(h, "granted", "q", harbor.id);
+  h.state.sendError = null;
+  const from = asked(h).length;
+  await h.invoke(
+    "action:reply-project",
+    { handoffId: data.handoffId, message: "Done." },
+    agent(harbor.id),
+  );
+  NodeAssert.deepEqual(
+    asked(h).slice(from).map((m) => m.text.split("\n")[0]),
+    ["Done.", "From Harbor."],
+  );
+  NodeAssert.equal(asked(h).at(-1).senderThreadId, harbor.id);
+});
+
+NodeTest.test("a person's action in the conversation delivers a stranded ask as that conversation", async () => {
+  const h = await askingHost();
+  await stranded(h);
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(asked(h)[0].senderThreadId, "coordinator-1");
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test("a person's action elsewhere can't send in that conversation's name", async () => {
+  const h = await askingHost();
+  await stranded(h);
+  await h.invoke("action:new-project", {}, personIn({ projectId: "p" }));
+  NodeAssert.deepEqual(asked(h), []);
+});
+
+NodeTest.test("a failed retry from a person's action wakes the agent", async () => {
+  const h = await askingHost();
+  await stranded(h);
+  const before = notes(h).length;
+  h.state.createError = new Error("Still busy.");
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(notes(h).length, before + 1);
+  NodeAssert.match(notes(h).at(-1).text, /Still busy\./);
+});
+
+NodeTest.test("a failed retry is in the result of the agent's own call", async () => {
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  await stranded(h);
+  h.state.createError = new Error("Still busy.");
+  const result = await ask(h, { projectId: "r", message: "Hello." });
+  NodeAssert.equal(result.data.status, "sent");
+  NodeAssert.match(result.message, /Still busy\./);
+});
 
 NodeTest.test(
   "the host's record decides, so a wrong answer input grants nothing",

@@ -198,6 +198,9 @@
       .replied {
         color: var(--success);
       }
+      .undelivered {
+        color: var(--warning);
+      }
       .done,
       .sent,
       .done + .context .title {
@@ -403,6 +406,8 @@
           done: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
           replied: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
           sent: '<circle cx="12" cy="12" r="10"/>',
+          undelivered:
+            '<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>',
           chevron: '<path d="m9 18 6-6-6-6"/>',
           remove: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
         };

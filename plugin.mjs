@@ -18,6 +18,7 @@ import {
   hashId,
   isProjectConversation,
   isUnanswered,
+  isUndelivered,
   isWorker,
   memoryKey,
   messagePreview,
@@ -366,43 +367,79 @@ export function activate(ctx) {
     });
 
   /**
-   * Sends one conversation's unsent messages to a project, oldest first. A failure stops the run
-   * and keeps the rest for a retry; it comes back as words for the agent to act on.
+   * Sends one conversation's unsent messages to a project, oldest first. Any failure stops the run
+   * and keeps the rest for a retry; it comes back as words for the agent to act on, so a caller
+   * whose grant already stands is never left with an exception and a stranded message.
    */
   const deliverAsks = async (threadId, projectId, invocation) => {
-    const { handoffs } = await readHandoffs();
-    for (const handoff of handoffs) {
-      if (
-        handoff.status !== "pending" ||
-        handoff.from.threadId !== threadId ||
-        handoff.to.projectId !== projectId
-      )
-        continue;
-      const opened = await ensureCoordinator(projectId, invocation);
-      if (opened.problem) return PROBLEMS[opened.problem];
-      try {
+    try {
+      const { handoffs } = await readHandoffs();
+      for (const handoff of handoffs) {
+        if (
+          !isUndelivered(handoff) ||
+          handoff.from.threadId !== threadId ||
+          handoff.to.projectId !== projectId
+        )
+          continue;
+        const opened = await ensureCoordinator(projectId, invocation);
+        if (opened.problem) return PROBLEMS[opened.problem];
         await ctx.threads.send({
           threadId: opened.threadId,
           text: askMessage(handoff),
           fromConversation: true,
           idempotencyKey: `ask-${handoff.id}`,
         });
-      } catch (error) {
-        return error?.message ?? "The message could not be sent.";
+        await saveHandoff({
+          ...handoff,
+          status: "sent",
+          text: messagePreview(handoff.text),
+          to: { projectId, threadId: opened.threadId },
+          sentAt: new Date().toISOString(),
+        });
       }
-      await saveHandoff({
-        ...handoff,
-        status: "sent",
-        text: messagePreview(handoff.text),
-        to: { projectId, threadId: opened.threadId },
-        sentAt: new Date().toISOString(),
-      });
+      return null;
+    } catch (error) {
+      return error?.message ?? "The message could not be sent.";
     }
-    return null;
+  };
+
+  /**
+   * Picks up what an earlier failure left behind. Only an agent's call or a person's action may do
+   * this: the sender comes from that caller, so views, statuses and trees can't send.
+   */
+  const retryAsks = async (threadId, invocation, skipProjectId) => {
+    const problems = [];
+    try {
+      const waiting = (await readHandoffs()).handoffs.filter(
+        (entry) =>
+          isUndelivered(entry) &&
+          entry.from.threadId === threadId &&
+          entry.to.projectId !== skipProjectId,
+      );
+      if (!waiting.length) return problems;
+      const { projects } = await listProjects(invocation, {
+        calls: SCAN_PAGES,
+      });
+      for (const projectId of new Set(waiting.map((h) => h.to.projectId))) {
+        // The rest are still waiting for a person's answer on the host's card.
+        if (!projects.has(projectId)) continue;
+        const problem = await deliverAsks(threadId, projectId, invocation);
+        if (problem) problems.push(problem);
+      }
+    } catch (error) {
+      problems.push(error?.message ?? "The message could not be sent.");
+    }
+    return problems;
   };
 
   const unsentNote = (problem) =>
-    `Your message to that project hasn't gone out: ${problem} It is kept: call ask-project again with the same projectId, message and operationId once that's sorted.`;
+    `Your message to another project hasn't gone out: ${problem} It is kept and goes out with your next ask-project or reply-project. To send it now, call ask-project again with the same projectId, message and operationId once that's sorted.`;
+
+  /** The same, for a result the agent reads. */
+  const retryNote = async (threadId, invocation, skipProjectId) => {
+    const [problem] = await retryAsks(threadId, invocation, skipProjectId);
+    return problem ? ` ${unsentNote(problem)}` : "";
+  };
 
   /** A plain note in a plugin-owned conversation, for what the agent can't see any other way. */
   const nudge = async (threadId, text) => {
@@ -430,6 +467,11 @@ export function activate(ctx) {
       invocation,
     );
     if (problem) return { message: PROBLEMS[problem] };
+    // A person acting in the conversation can send on its behalf; the agent hears if that fails.
+    if (context.threadId === threadId) {
+      const [failed] = await serial(() => retryAsks(threadId, invocation));
+      if (failed) await nudge(threadId, unsentNote(failed));
+    }
     // Like a new project in Claude Code Projects, the Overview is open the first time only.
     return {
       intents: [
@@ -507,8 +549,7 @@ export function activate(ctx) {
         };
       if (repeated?.status === "sent")
         return {
-          message:
-            "That message already went out. Its reply arrives in this conversation; end your turn.",
+          message: `That message already went out. Its reply arrives in this conversation; end your turn.${await retryNote(from.id, invocation)}`,
           data: { handoffId: repeated.id, status: "sent" },
         };
       const { status } = await ctx.projects.requestAccess({
@@ -520,8 +561,7 @@ export function activate(ctx) {
         if (repeated)
           await saveHandoff({ ...repeated, status: "declined", text: "" });
         return {
-          message:
-            "The person said not now to this project, so nothing was sent. Tell them plainly. You can ask again once they next write here.",
+          message: `The person said not now to this project, so nothing was sent. Tell them plainly. You can ask again once they next write here.${await retryNote(from.id, invocation, projectId)}`,
           data: { status },
         };
       }
@@ -570,17 +610,19 @@ export function activate(ctx) {
       };
       if (status === "pending")
         return {
-          message:
-            "The person needs to add this project first; T3 shows them a card here. The message is kept and goes out when they approve. Tell them plainly which project you need and why, then end your turn.",
+          message: `The person needs to add this project first; T3 shows them a card here. The message is kept and goes out when they approve. Tell them plainly which project you need and why, then end your turn.${await retryNote(from.id, invocation, projectId)}`,
           data: { handoffId: handoff.id, status },
           ...(await row()),
         };
       const problem = await deliverAsks(from.id, projectId, invocation);
+      const others = await retryNote(from.id, invocation, projectId);
       await invalidate(HANDOFF_TOPICS);
       return {
-        message: problem
-          ? unsentNote(problem)
-          : "Sent. The reply arrives in this conversation; end your turn.",
+        message: `${
+          problem
+            ? unsentNote(problem)
+            : "Sent. The reply arrives in this conversation; end your turn."
+        }${others}`,
         data: {
           handoffId: handoff.id,
           status: problem ? "pending" : "sent",
@@ -596,35 +638,41 @@ export function activate(ctx) {
     serial(async () => {
       const { projectId, threadId } = invocation.context ?? {};
       if (!projectId || !threadId) return {};
-      const { status } = await ctx.projects.requestAccess({
-        projectId,
-        threadId,
-        actionId: ACCESS_ANSWER,
-      });
-      const waiting = (await readHandoffs()).handoffs.filter(
-        (entry) =>
-          entry.status === "pending" && entry.to.projectId === projectId,
-      );
-      if (status === "declined") {
-        for (const handoff of waiting) {
-          await saveHandoff({ ...handoff, status: "declined", text: "" });
-          await nudge(
-            handoff.from.threadId,
-            `The person said not now to the project you asked, so this was not sent: "${messagePreview(handoff.text)}". Tell them plainly. You can ask again once they next write here.`,
-          );
+      try {
+        const { status } = await ctx.projects.requestAccess({
+          projectId,
+          threadId,
+          actionId: ACCESS_ANSWER,
+        });
+        const waiting = (await readHandoffs()).handoffs.filter(
+          (entry) => isUndelivered(entry) && entry.to.projectId === projectId,
+        );
+        if (status === "declined") {
+          for (const handoff of waiting) {
+            await saveHandoff({ ...handoff, status: "declined", text: "" });
+            await nudge(
+              handoff.from.threadId,
+              `The person said not now to the project you asked, so this was not sent: "${messagePreview(handoff.text)}". Tell them plainly. You can ask again once they next write here.`,
+            );
+          }
         }
-      }
-      if (status === "granted") {
-        const problem = await deliverAsks(threadId, projectId, invocation);
-        if (problem) await nudge(threadId, unsentNote(problem));
-        // One request serves a project, but a message only goes out in its own sender's name.
-        const others = new Set(waiting.map((entry) => entry.from.threadId));
-        others.delete(threadId);
-        for (const other of others)
-          await nudge(
-            other,
-            "The project you asked was added. Call ask-project again with the same projectId, message and operationId to send it.",
-          );
+        if (status === "granted") {
+          const problem = await deliverAsks(threadId, projectId, invocation);
+          if (problem) await nudge(threadId, unsentNote(problem));
+          // One request serves a project, but a message only goes out in its own sender's name.
+          const others = new Set(waiting.map((entry) => entry.from.threadId));
+          others.delete(threadId);
+          for (const other of others)
+            await nudge(
+              other,
+              "The project you asked was added. Call ask-project again with the same projectId, message and operationId to send it.",
+            );
+        }
+        const [failed] = await retryAsks(threadId, invocation, projectId);
+        if (failed) await nudge(threadId, unsentNote(failed));
+      } catch (error) {
+        // The grant stands whatever happens here, and only this note tells the agent.
+        await nudge(threadId, unsentNote(error?.message ?? "Something failed."));
       }
       await invalidate(HANDOFF_TOPICS);
       return {};
@@ -675,8 +723,9 @@ export function activate(ctx) {
           at: new Date().toISOString(),
         },
       });
+      const others = await retryNote(caller.threadId, invocation);
       await invalidate(HANDOFF_TOPICS);
-      return { message: "Reply sent to the project that asked." };
+      return { message: `Reply sent to the project that asked.${others}` };
     }),
   );
 
