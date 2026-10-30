@@ -3,16 +3,20 @@ import * as NodeTest from "node:test";
 import {
   appendNote,
   askMessage,
+  askUsedRecently,
   BRIEF,
   buildTree,
   CONVERSATION_BRIEF,
   coordinatorStatus,
   decodeCoordinators,
   decodeHandoffs,
+  discardAsks,
   GUIDE,
   groupWorkers,
   HANDOFF_LIMITS,
+  hashId,
   isWorker,
+  keepsPlace,
   MEMORY_LIMITS,
   messagePreview,
   otherProjects,
@@ -590,4 +594,51 @@ NodeTest.test("a project conversation an ask started isn't the asker's worker", 
   });
   NodeAssert.ok(!isWorker(conversation, "c"));
   NodeAssert.ok(isWorker(thread("w", { launchedFrom: { threadId: "c" } }), "c"));
+});
+
+const openAsk = (extra = {}) => ({
+  id: "ask-1",
+  status: "pending",
+  text: "Do the thing",
+  createdAt: "2026-10-01T00:00:00Z",
+  from: { threadId: "c", projectId: "p" },
+  to: { projectId: "q" },
+  ...extra,
+});
+
+NodeTest.test("a discarded ask stays used long after the quota's hour", () => {
+  const at = Date.parse("2026-10-01T00:00:00Z");
+  const store = { ...decodeHandoffs(null), handoffs: [openAsk()] };
+  const after = discardAsks(store, "c", hashId("q"), at);
+  NodeAssert.deepEqual(after.handoffs, []);
+  const day = 86_400_000;
+  NodeAssert.ok(askUsedRecently(after, "ask-1", at + day));
+  NodeAssert.ok(!askUsedRecently(after, "ask-1", at + 8 * day));
+  // A later discard forgets what has aged out, so the list stays bounded.
+  const later = discardAsks(
+    { ...after, handoffs: [openAsk({ id: "ask-2" })] },
+    "c",
+    hashId("q"),
+    at + 8 * day,
+  );
+  NodeAssert.deepEqual(later.discarded.map((entry) => entry.id), ["ask-2"]);
+});
+
+NodeTest.test("an unconfirmed ask gives up its place after a week", () => {
+  const at = Date.parse("2026-10-01T00:00:00Z");
+  const sending = openAsk({ status: "sending" });
+  const day = 86_400_000;
+  NodeAssert.ok(keepsPlace(sending, at + day));
+  NodeAssert.ok(!keepsPlace(sending, at + 8 * day));
+  // Deleted coordinators leave these behind, and they must not fill the store for good.
+  const full = Array.from({ length: 100 }, (_, n) =>
+    openAsk({ id: `old-${n}`, status: "sending" }),
+  );
+  const { handoffs } = putHandoff(
+    { ...decodeHandoffs(null), handoffs: full },
+    openAsk({ id: "new", createdAt: "2026-10-30T00:00:00Z" }),
+    at + 30 * day,
+  );
+  NodeAssert.equal(handoffs.length, 100);
+  NodeAssert.ok(handoffs.some((entry) => entry.id === "new"));
 });

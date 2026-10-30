@@ -625,7 +625,10 @@ export function activate(ctx) {
     if (
       (!repeated || !isUndelivered(repeated)) &&
       store.handoffs.filter(
-        (entry) => isUndelivered(entry) && entry.from.threadId === from.id,
+        (entry) =>
+          isUndelivered(entry) &&
+          keepsPlace(entry) &&
+          entry.from.threadId === from.id,
       ).length >= HANDOFF_LIMITS.pending
     )
       return {
