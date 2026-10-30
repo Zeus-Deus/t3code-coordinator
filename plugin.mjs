@@ -373,31 +373,45 @@ export function activate(ctx) {
     });
 
   /**
-   * Whether a send that may have gone through reached its target. The host keys its effects by
-   * caller and operation too, so after a lost outcome only the target itself can say.
+   * Whether a message that may have gone through reached its conversation, or null if that can't
+   * be told. The host keys its effects by caller and operation too, so after a lost outcome only
+   * the conversation itself can say.
    */
-  const reachedTarget = async (handoff) => {
+  const arrivedIn = async (threadId, marker) => {
     let messages;
     try {
-      ({ messages } = await ctx.threads.read({
-        threadId: handoff.to.threadId,
-      }));
+      ({ messages } = await ctx.threads.read({ threadId }));
     } catch {
-      throw new Error(UNCONFIRMED);
+      return null;
     }
-    const marker = askMarker(handoff.id);
     if (messages.some((m) => m.role === "user" && m.text.includes(marker)))
       return true;
-    if (messages.length >= READ_WINDOW) throw new Error(UNCONFIRMED);
-    return false;
+    return messages.length >= READ_WINDOW ? null : false;
   };
 
   /**
-   * Sends one conversation's unsent messages to a project, oldest first. Any failure stops the run
-   * and keeps the rest for a retry; it comes back as words for the agent to act on, so a caller
-   * whose grant already stands is never left with an exception and a stranded message.
+   * Sends at most once across retries, whoever is calling. `begin` saves the attempt first; a
+   * retry of an unconfirmed attempt looks for its marker before sending. False means it can't tell,
+   * and sending could duplicate the message.
+   */
+  const sendOnce = async ({ unconfirmed, begin, marker, ...message }) => {
+    if (unconfirmed) {
+      const arrived = await arrivedIn(message.threadId, marker);
+      if (arrived === null) return false;
+      if (arrived) return true;
+    } else await begin();
+    await ctx.threads.send({ ...message, fromConversation: true });
+    return true;
+  };
+
+  /**
+   * Sends one conversation's unsent messages to a project, oldest first. A failure stops the run
+   * and keeps the rest for a retry, except that an attempt of unknown outcome is stepped over so
+   * it can't hold up later asks. The problem comes back as words for the agent to act on, so a
+   * caller whose grant already stands is never left with an exception and a stranded message.
    */
   const deliverAsks = async (threadId, projectId, invocation) => {
+    let unresolved = null;
     try {
       const { handoffs } = await readHandoffs();
       for (const handoff of handoffs) {
@@ -407,31 +421,36 @@ export function activate(ctx) {
           handoff.to.projectId !== projectId
         )
           continue;
-        const opened = await ensureCoordinator(projectId, invocation);
-        if (opened.problem) return PROBLEMS[opened.problem];
-        const to = { projectId, threadId: opened.threadId };
-        // A replacement conversation can't hold the first copy, so only the same one is checked.
-        const unconfirmed =
-          handoff.status === "sending" &&
-          handoff.to.threadId === opened.threadId;
-        if (!unconfirmed)
-          await saveHandoff({ ...handoff, status: "sending", to });
-        if (!unconfirmed || !(await reachedTarget(handoff)))
-          await ctx.threads.send({
+        try {
+          const opened = await ensureCoordinator(projectId, invocation);
+          if (opened.problem) return PROBLEMS[opened.problem];
+          const to = { projectId, threadId: opened.threadId };
+          const sent = await sendOnce({
+            // A replacement conversation can't hold the first copy, so only the same one is read.
+            unconfirmed:
+              handoff.status === "sending" &&
+              handoff.to.threadId === opened.threadId,
+            begin: () => saveHandoff({ ...handoff, status: "sending", to }),
+            marker: askMarker(handoff.id),
             threadId: opened.threadId,
             text: askMessage(handoff),
-            fromConversation: true,
             idempotencyKey: `ask-${handoff.id}`,
           });
-        await saveHandoff({
-          ...handoff,
-          status: "sent",
-          text: messagePreview(handoff.text),
-          to,
-          sentAt: new Date().toISOString(),
-        });
+          if (sent)
+            await saveHandoff({
+              ...handoff,
+              status: "sent",
+              text: messagePreview(handoff.text),
+              to,
+              sentAt: new Date().toISOString(),
+            });
+          else unresolved ??= UNCONFIRMED;
+        } catch (error) {
+          if (handoff.status !== "sending") throw error;
+          unresolved ??= error?.message ?? UNCONFIRMED;
+        }
       }
-      return null;
+      return unresolved;
     } catch (error) {
       return error?.message ?? "The message could not be sent.";
     }
@@ -662,16 +681,19 @@ export function activate(ctx) {
       const problem = await deliverAsks(from.id, projectId, invocation);
       const others = await retryNote(from.id, invocation, projectId);
       await invalidate(HANDOFF_TOPICS);
+      // The problem may be an older attempt's, which this ask went past.
+      const sent = (await readHandoffs()).handoffs.some(
+        (entry) => entry.id === handoff.id && entry.status === "sent",
+      );
       return {
-        message: `${
-          problem
-            ? unsentNote(problem)
-            : "Sent. The reply arrives in this conversation; end your turn."
-        }${others}`,
-        data: {
-          handoffId: handoff.id,
-          status: problem ? "pending" : "sent",
-        },
+        message: [
+          sent && "Sent. The reply arrives in this conversation; end your turn.",
+          problem && unsentNote(problem),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .concat(others),
+        data: { handoffId: handoff.id, status: sent ? "sent" : "pending" },
         ...(await row()),
       };
     }),
@@ -731,12 +753,11 @@ export function activate(ctx) {
       if (caller.kind !== "agent" || !caller.threadId)
         throw new Error("Replies come from a project's main conversation.");
       const text = handoffText(input?.message);
-      // Only a stored handoff addressed to this conversation says where a reply may go.
+      // Only a stored handoff addressed to this conversation says where a reply may go. A target
+      // is set just before the first send, so a reply also proves an unconfirmed send arrived.
       const handoff = (await readHandoffs()).handoffs.find(
         (entry) =>
-          entry.id === input?.handoffId &&
-          entry.status === "sent" &&
-          entry.to.threadId === caller.threadId,
+          entry.id === input?.handoffId && entry.to.threadId === caller.threadId,
       );
       if (!handoff)
         throw new Error(
@@ -762,6 +783,9 @@ export function activate(ctx) {
       });
       await saveHandoff({
         ...handoff,
+        status: "sent",
+        text: messagePreview(handoff.text),
+        sentAt: handoff.sentAt ?? new Date().toISOString(),
         reply: {
           id,
           digest,

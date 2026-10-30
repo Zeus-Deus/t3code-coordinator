@@ -1282,6 +1282,48 @@ NodeTest.test("the same fault is safe through every retry path", async () => {
   NodeAssert.equal(asked(other).filter((m) => /health check/.test(m.text)).length, 1);
 });
 
+NodeTest.test("an attempt of unknown outcome doesn't hold up later asks", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "unknown-first");
+  await lostAfterSend(h, invocation);
+  h.state.readError = new Error("The host is busy.");
+  const later = await ask(h, { message: "A later ask." });
+  NodeAssert.equal(later.data.status, "sent");
+  NodeAssert.match(later.message, /^Sent\./);
+  NodeAssert.match(later.message, /Couldn't check whether it already arrived/);
+  NodeAssert.equal(asked(h).length, 2);
+  const stored = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.deepEqual(stored.map((h) => h.status), ["sending", "sent"]);
+  // It stays on the list, and clears once the conversation can be read.
+  h.state.readError = null;
+  await ask(h, { message: "Another." });
+  NodeAssert.equal(asked(h).length, 3);
+  NodeAssert.deepEqual(
+    h.state.storage.get("handoffs.v1").handoffs.map((h) => h.status),
+    ["sent", "sent", "sent"],
+  );
+});
+
+NodeTest.test("a reply proves an attempt of unknown outcome arrived", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "proved");
+  const { id, to } = await lostAfterSend(h, invocation);
+  await h.invoke(
+    "action:reply-project",
+    { handoffId: id, message: "It got here." },
+    agent(to.threadId),
+  );
+  const [handoff] = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(handoff.status, "sent");
+  NodeAssert.ok(handoff.sentAt);
+  NodeAssert.equal((await panel(h)).others[0].state, "replied");
+  NodeAssert.deepEqual(h.state.reads, []);
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.match(retry.message, /already went out/);
+  NodeAssert.deepEqual(h.state.reads, []);
+  NodeAssert.equal(asked(h).filter((m) => /health check/.test(m.text)).length, 1);
+});
+
 NodeTest.test("a send that never happened goes out on the retry", async () => {
   const h = await askingHost();
   const invocation = agent("coordinator-1", "unsent");
