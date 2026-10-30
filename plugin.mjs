@@ -4,6 +4,7 @@
 import {
   appendNote,
   askedRow,
+  askMarker,
   askMessage,
   askQuotaSpent,
   BRIEF,
@@ -38,6 +39,8 @@ const HANDOFFS = "handoffs.v1";
 const PAGE = 200;
 // Every page loads the whole project on the host, and statuses and views are read often.
 const SCAN_PAGES = 10;
+// threads.read returns this many messages at most, so a full page can't show that one is absent.
+const READ_WINDOW = 30;
 // Total scan calls across accessible projects, with headroom for context and memory reads.
 const READ_BUDGET = 70;
 // Host calls one tree read may spend across every project; the rest stay in Other.
@@ -55,6 +58,8 @@ const HANDOFF_TOPICS = [...TOPICS, `view:${ASKED}`];
 // The hidden action the host runs when a person answers its project card.
 const ACCESS_ANSWER = "project-access";
 // Opening never guesses: these cases leave the choice to the person.
+const UNCONFIRMED =
+  "Couldn't check whether it already arrived, so it wasn't sent again.";
 const PROBLEMS = {
   unknown:
     "Couldn't check this project's conversation, so nothing was started. Try again.",
@@ -367,6 +372,26 @@ export function activate(ctx) {
     });
 
   /**
+   * Whether a send that may have gone through reached its target. The host keys its effects by
+   * caller and operation too, so after a lost outcome only the target itself can say.
+   */
+  const reachedTarget = async (handoff) => {
+    let messages;
+    try {
+      ({ messages } = await ctx.threads.read({
+        threadId: handoff.to.threadId,
+      }));
+    } catch {
+      throw new Error(UNCONFIRMED);
+    }
+    const marker = askMarker(handoff.id);
+    if (messages.some((m) => m.role === "user" && m.text.includes(marker)))
+      return true;
+    if (messages.length >= READ_WINDOW) throw new Error(UNCONFIRMED);
+    return false;
+  };
+
+  /**
    * Sends one conversation's unsent messages to a project, oldest first. Any failure stops the run
    * and keeps the rest for a retry; it comes back as words for the agent to act on, so a caller
    * whose grant already stands is never left with an exception and a stranded message.
@@ -383,17 +408,25 @@ export function activate(ctx) {
           continue;
         const opened = await ensureCoordinator(projectId, invocation);
         if (opened.problem) return PROBLEMS[opened.problem];
-        await ctx.threads.send({
-          threadId: opened.threadId,
-          text: askMessage(handoff),
-          fromConversation: true,
-          idempotencyKey: `ask-${handoff.id}`,
-        });
+        const to = { projectId, threadId: opened.threadId };
+        // A replacement conversation can't hold the first copy, so only the same one is checked.
+        const unconfirmed =
+          handoff.status === "sending" &&
+          handoff.to.threadId === opened.threadId;
+        if (!unconfirmed)
+          await saveHandoff({ ...handoff, status: "sending", to });
+        if (!unconfirmed || !(await reachedTarget(handoff)))
+          await ctx.threads.send({
+            threadId: opened.threadId,
+            text: askMessage(handoff),
+            fromConversation: true,
+            idempotencyKey: `ask-${handoff.id}`,
+          });
         await saveHandoff({
           ...handoff,
           status: "sent",
           text: messagePreview(handoff.text),
-          to: { projectId, threadId: opened.threadId },
+          to,
           sentAt: new Date().toISOString(),
         });
       }
@@ -558,7 +591,7 @@ export function activate(ctx) {
         actionId: ACCESS_ANSWER,
       });
       if (status === "declined") {
-        if (repeated)
+        if (repeated?.status === "pending")
           await saveHandoff({ ...repeated, status: "declined", text: "" });
         return {
           message: `The person said not now to this project, so nothing was sent. Tell them plainly. You can ask again once they next write here.${await retryNote(from.id, invocation, projectId)}`,
@@ -567,8 +600,7 @@ export function activate(ctx) {
       }
       if (
         !repeated &&
-        store.handoffs.filter((entry) => entry.status === "pending").length >=
-          HANDOFF_LIMITS.pending
+        store.handoffs.filter(isUndelivered).length >= HANDOFF_LIMITS.pending
       )
         throw new Error(
           "Too many messages are waiting to go out. Ask the person to answer the project cards first.",
@@ -588,7 +620,7 @@ export function activate(ctx) {
         reply: null,
         createdAt: new Date().toISOString(),
         ...repeated,
-        status: "pending",
+        status: repeated?.status === "sending" ? "sending" : "pending",
         text,
       };
       await ctx.storage.set(
@@ -648,7 +680,8 @@ export function activate(ctx) {
           (entry) => isUndelivered(entry) && entry.to.projectId === projectId,
         );
         if (status === "declined") {
-          for (const handoff of waiting) {
+          // A `sending` ask may already be there, so it can't be called unsent.
+          for (const handoff of waiting.filter((h) => h.status === "pending")) {
             await saveHandoff({ ...handoff, status: "declined", text: "" });
             await nudge(
               handoff.from.threadId,
@@ -749,7 +782,7 @@ export function activate(ctx) {
   ctx.handle(`view:${VIEW}:read`, async (_input, invocation) => {
     const { thread, projectId, coordinator } =
       await overviewContext(invocation);
-    // A worker elsewhere opens its launcher's panel, but that project's messages stay in that project.
+    // A worker elsewhere opens its launcher's panel, but that project's messages stay with it.
     const handoffs =
       coordinator && thread.projectId === projectId
         ? (await readHandoffs()).handoffs.filter(

@@ -59,6 +59,12 @@ function host({
     declinedProjects: new Set(),
     sendError: null,
     accessError: null,
+    readError: null,
+    writeError: null,
+    crashAfterSend: false,
+    messages: new Map(),
+    reads: [],
+    statusesAtSend: [],
     handler: null,
     caller: null,
     contextThreadId: null,
@@ -89,10 +95,14 @@ function host({
       get: counted(async (key) =>
         structuredClone(state.storage.get(key) ?? null),
       ),
-      set: counted(
-        async (key, value) =>
-          void state.storage.set(key, structuredClone(value)),
-      ),
+      set: counted(async (key, value) => {
+        if (state.writeError) {
+          const error = state.writeError;
+          state.writeError = null;
+          throw error;
+        }
+        state.storage.set(key, structuredClone(value));
+      }),
       delete: counted(async (key) => void state.storage.delete(key)),
     },
     threads: {
@@ -155,7 +165,27 @@ function host({
         state.threads.get(threadId).archivedAt = null;
         return { threadId };
       }),
+      read: counted(async ({ threadId }) => {
+        if (state.readError) throw state.readError;
+        const target = state.threads.get(threadId);
+        if (!target || target.deleted) throw denied();
+        if (state.deniedProjects.has(target.projectId)) throw denied();
+        state.reads.push(threadId);
+        return {
+          threadId,
+          projectId: target.projectId,
+          title: target.title,
+          messages: (state.messages.get(threadId) ?? [])
+            .slice(-30)
+            .map((m) => ({ ...m, text: m.text.slice(0, 4096) })),
+        };
+      }),
       send: counted(async (input) => {
+        state.statusesAtSend.push(
+          ...(state.storage.get("handoffs.v1")?.handoffs ?? [])
+            .filter((entry) => entry.id && input.idempotencyKey === `ask-${entry.id}`)
+            .map((entry) => entry.status),
+        );
         if (state.sendError) throw state.sendError;
         const target = state.threads.get(input.threadId);
         if (!target || target.deleted) throw denied();
@@ -168,6 +198,19 @@ function host({
         }
         if (target.archivedAt) throw new Error("The thread is archived.");
         state.sent.push({ ...input, senderThreadId: from });
+        // The host's own header, which counts toward what a later read gets back.
+        const title = projects.find(
+          (project) => project.id === state.threads.get(from)?.projectId,
+        )?.title;
+        const header = `[Plugin: Project Coordinator${title === undefined ? "" : `, from project ${JSON.stringify(title.slice(0, 200))}`}]`;
+        state.messages.set(input.threadId, [
+          ...(state.messages.get(input.threadId) ?? []),
+          { id: `m-${state.sent.length}`, role: "user", text: `${header}\n${input.text}` },
+        ]);
+        if (state.crashAfterSend) {
+          state.crashAfterSend = false;
+          state.writeError = new Error("The process died.");
+        }
         return { threadId: input.threadId, runId: "run", delivery: "started" };
       }),
     },
@@ -1184,6 +1227,160 @@ NodeTest.test(
   },
 );
 
+/** Stops the process at the worst moment: the host took the message, the plugin never saved that. */
+async function lostAfterSend(h, invocation) {
+  await ask(h, {}, invocation);
+  h.state.crashAfterSend = true;
+  await answer(h, "granted");
+  const [handoff] = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(handoff.status, "sending");
+  NodeAssert.equal(asked(h).length, 1);
+  return handoff;
+}
+
+NodeTest.test("an ask is marked sending before the send, not after", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  await ask(h);
+  NodeAssert.deepEqual(h.state.statusesAtSend, ["sending"]);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sent");
+  // A first send has nothing to check for.
+  NodeAssert.deepEqual(h.state.reads, []);
+});
+
+NodeTest.test(
+  "a fault between send and save doesn't send twice on the agent's retry",
+  async () => {
+    const h = await askingHost();
+    const invocation = agent("coordinator-1", "lost");
+    const { to } = await lostAfterSend(h, invocation);
+    // Told, but still undelivered, so it shows.
+    NodeAssert.match(notes(h)[0].text, /hasn't gone out: The process died\./);
+    NodeAssert.equal((await panel(h)).others[0].state, "undelivered");
+
+    // A fresh invocation: the host's own replay protection doesn't cover this.
+    const retry = await ask(h, {}, { ...invocation, operationId: "lost" });
+    NodeAssert.equal(retry.data.status, "sent");
+    NodeAssert.deepEqual(h.state.reads, [to.threadId]);
+    NodeAssert.equal(asked(h).length, 1);
+    NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sent");
+    NodeAssert.equal((await panel(h)).others[0].state, "sent");
+  },
+);
+
+NodeTest.test("the same fault is safe through every retry path", async () => {
+  const h = await askingHost();
+  await lostAfterSend(h);
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sent");
+
+  const other = await askingHost();
+  await other.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  await lostAfterSend(other);
+  await ask(other, { projectId: "r", message: "Hello Harbor." });
+  NodeAssert.equal(asked(other).filter((m) => /health check/.test(m.text)).length, 1);
+});
+
+NodeTest.test("a send that never happened goes out on the retry", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "unsent");
+  await ask(h, {}, invocation);
+  h.state.sendError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.sendError = null;
+  NodeAssert.deepEqual(asked(h), []);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sending");
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.equal(retry.data.status, "sent");
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.reads.length, 1);
+});
+
+NodeTest.test("if the target can't be read, nothing is sent and the agent hears why", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "unreadable");
+  await lostAfterSend(h, invocation);
+  h.state.readError = new Error("The host is busy.");
+  const blocked = await ask(h, {}, invocation);
+  NodeAssert.equal(blocked.data.status, "pending");
+  NodeAssert.match(blocked.message, /Couldn't check whether it already arrived/);
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sending");
+  NodeAssert.equal((await panel(h)).others[0].state, "undelivered");
+  h.state.readError = null;
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.equal(retry.data.status, "sent");
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test("a full page of messages can't prove an ask isn't further back", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "buried");
+  const { to } = await lostAfterSend(h, invocation);
+  h.state.messages.set(
+    to.threadId,
+    Array.from({ length: 30 }, (_, i) => ({ id: `n${i}`, role: "user", text: "Busy." })),
+  );
+  const blocked = await ask(h, {}, invocation);
+  NodeAssert.match(blocked.message, /Couldn't check whether it already arrived/);
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test("only the delivered message counts, not an agent quoting the id", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "quoted");
+  const { id, to } = await lostAfterSend(h, invocation);
+  h.state.messages.set(to.threadId, [
+    { id: "a", role: "assistant", text: `I saw handoffId "${id}" somewhere.` },
+  ]);
+  await ask(h, {}, invocation);
+  NodeAssert.equal(asked(h).length, 2);
+});
+
+NodeTest.test("a conversation replaced after a lost send gets the message", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "replaced");
+  const { to } = await lostAfterSend(h, invocation);
+  h.state.threads.get(to.threadId).deleted = true;
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.equal(retry.data.status, "sent");
+  NodeAssert.deepEqual(h.state.reads, []);
+  NodeAssert.notEqual(asked(h).at(-1).threadId, to.threadId);
+  NodeAssert.equal(createdInAtlas(h).length, 2);
+});
+
+NodeTest.test("Not now doesn't call a send of unknown outcome unsent", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "unknown");
+  await lostAfterSend(h, invocation);
+  h.state.deniedProjects.add("q");
+  h.state.declinedProjects.add("q");
+  const result = await ask(h, {}, invocation);
+  NodeAssert.equal(result.data.status, "declined");
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sending");
+});
+
+NodeTest.test("the footer survives the host's read at the longest message and title", async () => {
+  const title = `"${"\"".repeat(198)}"`;
+  const h = host({
+    projects: [
+      { id: "p", title },
+      { id: "q", title: "Atlas" },
+    ],
+    capabilities: HANDOFF_CAPABILITIES,
+  });
+  await h.invoke("action:new-project", {}, personIn({ projectId: "p" }));
+  h.state.deniedProjects.add("q");
+  const invocation = agent("coordinator-1", "longest");
+  await ask(h, { message: "x".repeat(3000) }, invocation);
+  h.state.crashAfterSend = true;
+  await answer(h, "granted");
+  await ask(h, { message: "x".repeat(3000) }, invocation);
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.reads.length, 1);
+});
+
 /** An approved ask the host failed to deliver: the grant stands, and it is still undelivered. */
 async function stranded(h) {
   const { card } = await ask(h);
@@ -1415,8 +1612,8 @@ NodeTest.test("only a project's main conversation asks, about another project", 
   await NodeAssert.rejects(ask(h, { projectId: "" }), /Name the project/);
   await NodeAssert.rejects(ask(h, { message: " " }), /needs text/);
   await NodeAssert.rejects(
-    ask(h, { message: "x".repeat(4001) }),
-    /under 4000 characters/,
+    ask(h, { message: "x".repeat(3001) }),
+    /under 3000 characters/,
   );
   NodeAssert.deepEqual(h.state.accessRequests, []);
 });
