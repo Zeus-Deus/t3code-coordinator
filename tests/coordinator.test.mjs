@@ -338,6 +338,10 @@ NodeTest.test(
     ])
       NodeAssert.ok(GUIDE.includes(tool), tool);
     NodeAssert.match(GUIDE, /what the project should accomplish/);
+    NodeAssert.match(GUIDE, /merges the person agreed to/);
+    NodeAssert.match(GUIDE, /check git status and the current branch/);
+    NodeAssert.match(GUIDE, /never stash, discard or commit/);
+    NodeAssert.match(GUIDE, /Push only when the person asks/);
     NodeAssert.ok(CONVERSATION_BRIEF.includes(GUIDE));
   },
 );
