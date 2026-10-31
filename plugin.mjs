@@ -1,26 +1,51 @@
 // Project Coordinator: one coordinator thread per project, a Projects tree with its workers nested
-// under it, and shared project memory. Delegation stays in T3's orchestration tools; this plugin
-// never starts workers.
+// under it, shared project memory, and messages between project coordinators. Delegation stays in
+// T3's orchestration tools; this plugin never starts workers.
 import {
   appendNote,
+  askedRow,
+  askMarker,
+  askMessage,
+  askQuotaSpent,
+  askUsedRecently,
   BRIEF,
   buildTree,
   CONVERSATION_BRIEF,
   decodeCoordinators,
+  decodeHandoffs,
   decodeMemory,
+  discardAsks,
+  expireHandoffs,
   GUIDE,
+  HANDOFF_LIMITS,
+  handoffText,
   hashId,
+  isProjectConversation,
+  isUndelivered,
   isWorker,
+  keepsPlace,
   memoryKey,
+  messagePreview,
   noteText,
+  otherProjects,
   overview,
+  overviewSummary,
   projectSection,
+  putHandoff,
+  recordAsk,
+  repeatedAsk,
+  replyMarker,
+  replyMessage,
+  takeExpiredNote,
 } from "./lib/coordinator.mjs";
 
 const COORDINATORS = "coordinators.v1";
+const HANDOFFS = "handoffs.v1";
 const PAGE = 200;
 // Every page loads the whole project on the host, and statuses and views are read often.
 const SCAN_PAGES = 10;
+// threads.read returns this many messages at most, so a full page can't show that one is absent.
+const READ_WINDOW = 30;
 // Total scan calls across accessible projects, with headroom for context and memory reads.
 const READ_BUDGET = 70;
 // Host calls one tree read may spend across every project; the rest stay in Other.
@@ -33,7 +58,15 @@ const CONVERSATIONS = "ui.native-tree-conversations";
 // Optional: the Projects tab as its own view, owning its conversations, which leave Activity.
 const PROJECTS = "ui.native-tree-projects";
 const OWNER = `tree:${TREE}`;
+const ASKED = "asked";
+const HANDOFF_TOPICS = [...TOPICS, `view:${ASKED}`];
+// The hidden action the host runs when a person answers its project card.
+const ACCESS_ANSWER = "project-access";
 // Opening never guesses: these cases leave the choice to the person.
+const DISCARD_HINT =
+  "Stop here and tell the person they can discard asks in the Overview.";
+const UNCONFIRMED =
+  "Couldn't check whether it already arrived, so it wasn't sent again.";
 const PROBLEMS = {
   unknown:
     "Couldn't check this project's conversation, so nothing was started. Try again.",
@@ -43,6 +76,9 @@ const PROBLEMS = {
     "This project's conversation is archived. Restore it from Settings → Archive.",
   noAgent:
     "No agent is ready on this device. Sign in to one in Settings → Providers, then choose this project again.",
+  // Only a person's action can restore a thread.
+  restore:
+    "That project's conversation is archived. A person has to bring it back: New project in the Projects tab, then that project.",
 };
 
 export function activate(ctx) {
@@ -57,6 +93,30 @@ export function activate(ctx) {
     decodeCoordinators(await ctx.storage.get(COORDINATORS));
   const readMemory = async (projectId) =>
     decodeMemory(await ctx.storage.get(memoryKey(projectId)));
+  const readHandoffs = async () =>
+    decodeHandoffs(await ctx.storage.get(HANDOFFS));
+  const saveHandoff = async (handoff) =>
+    ctx.storage.set(HANDOFFS, putHandoff(await readHandoffs(), handoff));
+  /** Housekeeping: a failure here must not get in the way of what the caller came to do. */
+  const pruneStored = async () => {
+    try {
+      const store = await readHandoffs();
+      const pruned = expireHandoffs(store);
+      if (pruned !== store) await ctx.storage.set(HANDOFFS, pruned);
+    } catch (error) {
+      ctx.log("warn", `Could not expire old asks: ${error?.message}`);
+    }
+  };
+  /** Noted once, on a result the agent is already reading, so an expiry never wakes it. */
+  const expiredNote = async (threadId) => {
+    try {
+      const { store, note } = takeExpiredNote(await readHandoffs(), threadId);
+      if (note) await ctx.storage.set(HANDOFFS, store);
+      return note;
+    } catch {
+      return "";
+    }
+  };
 
   const listThreads = async (projectId, invocation, budget) => {
     const threads = new Map();
@@ -200,9 +260,6 @@ export function activate(ctx) {
   const projectsView = () =>
     conversations() && ctx.capabilities?.includes(PROJECTS);
 
-  const isConversation = (thread) =>
-    thread.pluginOwner?.treeId === TREE && !thread.lineage?.parentThreadId;
-
   /**
    * Where a project's conversation stands. Only a conversation that is provably gone may be
    * replaced: a failed or denied lookup is "unknown", so a second conversation never appears
@@ -232,7 +289,9 @@ export function activate(ctx) {
     if (!scan.complete) return { state: "unknown" };
     if (stored && scan.threads.some((t) => t.id === stored.threadId))
       return { state: "unknown" };
-    const owned = projectsView() ? scan.threads.filter(isConversation) : [];
+    const owned = projectsView()
+      ? scan.threads.filter(isProjectConversation)
+      : [];
     if (owned.length > 1) return { state: "ambiguous" };
     if (owned.length === 1)
       return {
@@ -267,59 +326,62 @@ export function activate(ctx) {
     }
   };
 
+  const ensureCoordinator = async (projectId, invocation) => {
+    const found = await resolveCoordinator(projectId, invocation);
+    if (found.state === "unknown" || found.state === "ambiguous")
+      return { problem: found.state };
+    if (found.state === "archived" && !projectsView())
+      return { problem: "archived" };
+    if (found.state === "archived" && invocation.caller.kind !== "client")
+      return { problem: "restore" };
+    if (found.state === "live" || found.state === "archived") {
+      const { thread } = found;
+      // Re-adding a project brings back the same conversation, with its history and memory.
+      if (found.state === "archived")
+        await ctx.threads.unarchive({ threadId: thread.id });
+      await adopt(thread);
+      const known = await remember(projectId, thread.id);
+      if (found.state === "archived" || !known) await invalidate(TOPICS);
+      return { threadId: thread.id, created: false };
+    }
+    // A plan-mode source thread would otherwise make the coordinator and its workers plan-only.
+    const common = { projectId, interactionMode: "default" };
+    const create = async () =>
+      conversations()
+        ? // The project heading is this conversation, so it carries the project's name and starts
+          // empty: the brief rides along with the person's first message instead of a run now.
+          await ctx.threads.create({
+            ...common,
+            title:
+              (await listProjects(invocation, { calls: 2 })).projects.get(
+                projectId,
+              )?.title ?? "Project",
+            brief: CONVERSATION_BRIEF,
+            ...(projectsView() ? { owner: OWNER } : {}),
+            idempotencyKey: "open-conversation",
+          })
+        : await ctx.threads.create({
+            ...common,
+            // The breadcrumb already names the project: "Shelf / Coordinator".
+            title: "Coordinator",
+            text: BRIEF,
+            idempotencyKey: "start-coordinator",
+          });
+    let threadId;
+    try {
+      ({ threadId } = await create());
+    } catch (error) {
+      // A device without a signed-in agent has no model to give a new thread.
+      if (error?.reason === "invalid_input" && /model/i.test(error.message))
+        return { problem: "noAgent" };
+      throw error;
+    }
+    await remember(projectId, threadId);
+    await invalidate(TOPICS);
+    return { threadId, created: true };
+  };
   const openCoordinator = (projectId, invocation) =>
-    serial(async () => {
-      const found = await resolveCoordinator(projectId, invocation);
-      if (found.state === "unknown" || found.state === "ambiguous")
-        return { problem: found.state };
-      if (found.state === "archived" && !projectsView())
-        return { problem: "archived" };
-      if (found.state === "live" || found.state === "archived") {
-        const { thread } = found;
-        // Re-adding a project brings back the same conversation, with its history and memory.
-        if (found.state === "archived")
-          await ctx.threads.unarchive({ threadId: thread.id });
-        await adopt(thread);
-        const known = await remember(projectId, thread.id);
-        if (found.state === "archived" || !known) await invalidate(TOPICS);
-        return { threadId: thread.id, created: false };
-      }
-      // A plan-mode source thread would otherwise make the coordinator and its workers plan-only.
-      const common = { projectId, interactionMode: "default" };
-      const create = async () =>
-        conversations()
-          ? // The project heading is this conversation, so it carries the project's name and starts
-            // empty: the brief rides along with the person's first message instead of a run now.
-            await ctx.threads.create({
-              ...common,
-              title:
-                (await listProjects(invocation, { calls: 2 })).projects.get(
-                  projectId,
-                )?.title ?? "Project",
-              brief: CONVERSATION_BRIEF,
-              ...(projectsView() ? { owner: OWNER } : {}),
-              idempotencyKey: "open-conversation",
-            })
-          : await ctx.threads.create({
-              ...common,
-              // The breadcrumb already names the project: "Shelf / Coordinator".
-              title: "Coordinator",
-              text: BRIEF,
-              idempotencyKey: "start-coordinator",
-            });
-      let threadId;
-      try {
-        ({ threadId } = await create());
-      } catch (error) {
-        // A device without a signed-in agent has no model to give a new thread.
-        if (error?.reason === "invalid_input" && /model/i.test(error.message))
-          return { problem: "noAgent" };
-        throw error;
-      }
-      await remember(projectId, threadId);
-      await invalidate(TOPICS);
-      return { threadId, created: true };
-    });
+    serial(() => ensureCoordinator(projectId, invocation));
 
   const addNote = (projectId, note) =>
     serial(async () => {
@@ -336,6 +398,144 @@ export function activate(ctx) {
       return memory;
     });
 
+  /**
+   * Whether a message that may have gone through reached its conversation, or null if that can't
+   * be told. The host keys its effects by caller and operation too, so after a lost outcome only
+   * the conversation itself can say.
+   */
+  const arrivedIn = async (threadId, marker) => {
+    let messages;
+    try {
+      ({ messages } = await ctx.threads.read({ threadId }));
+    } catch {
+      return null;
+    }
+    if (messages.some((m) => m.role === "user" && m.text.includes(marker)))
+      return true;
+    return messages.length >= READ_WINDOW ? null : false;
+  };
+
+  /**
+   * Sends at most once across retries, whoever is calling. `begin` saves the attempt first; a
+   * retry of an unconfirmed attempt looks for its marker before sending. False means it can't tell,
+   * and sending could duplicate the message.
+   */
+  const sendOnce = async ({ unconfirmed, begin, marker, ...message }) => {
+    if (unconfirmed) {
+      const arrived = await arrivedIn(message.threadId, marker);
+      if (arrived === null) return false;
+      if (arrived) return true;
+    } else await begin();
+    await ctx.threads.send({ ...message, fromConversation: true });
+    return true;
+  };
+
+  /**
+   * Sends one conversation's unsent messages to a project, oldest first. A failure stops the run
+   * and keeps the rest for a retry, except that an attempt of unknown outcome is stepped over so
+   * it can't hold up later asks. The problem comes back as words for the agent to act on, so a
+   * caller whose grant already stands is never left with an exception and a stranded message.
+   */
+  const deliverAsks = async (threadId, projectId, invocation) => {
+    let unresolved = null;
+    try {
+      const { handoffs } = await readHandoffs();
+      for (const handoff of handoffs) {
+        // Past `keepsPlace` an ask is outside the cap, so it can't join a delivery's call budget.
+        if (
+          !isUndelivered(handoff) ||
+          !keepsPlace(handoff) ||
+          handoff.from.threadId !== threadId ||
+          handoff.to.projectId !== projectId
+        )
+          continue;
+        try {
+          const opened = await ensureCoordinator(projectId, invocation);
+          if (opened.problem) return PROBLEMS[opened.problem];
+          const to = { projectId, threadId: opened.threadId };
+          const sent = await sendOnce({
+            // A replacement conversation can't hold the first copy, so only the same one is read.
+            unconfirmed:
+              handoff.status === "sending" &&
+              handoff.to.threadId === opened.threadId,
+            begin: () => saveHandoff({ ...handoff, status: "sending", to }),
+            marker: askMarker(handoff.id),
+            threadId: opened.threadId,
+            text: askMessage(handoff),
+            idempotencyKey: `ask-${handoff.id}`,
+          });
+          if (sent)
+            await saveHandoff({
+              ...handoff,
+              status: "sent",
+              text: messagePreview(handoff.text),
+              to,
+              sentAt: new Date().toISOString(),
+            });
+          else unresolved ??= UNCONFIRMED;
+        } catch (error) {
+          if (handoff.status !== "sending") throw error;
+          unresolved ??= error?.message ?? UNCONFIRMED;
+        }
+      }
+      return unresolved;
+    } catch (error) {
+      return error?.message ?? "The message could not be sent.";
+    }
+  };
+
+  /**
+   * Picks up what an earlier failure left behind. Only an agent's call or a person's action may do
+   * this: the sender comes from that caller, so views, statuses and trees can't send.
+   */
+  const retryAsks = async (threadId, invocation, skipProjectId) => {
+    const problems = [];
+    try {
+      const waiting = (await readHandoffs()).handoffs.filter(
+        (entry) =>
+          isUndelivered(entry) &&
+          keepsPlace(entry) &&
+          entry.from.threadId === threadId &&
+          entry.to.projectId !== skipProjectId,
+      );
+      if (!waiting.length) return problems;
+      const { projects } = await listProjects(invocation, {
+        calls: SCAN_PAGES,
+      });
+      for (const projectId of new Set(waiting.map((h) => h.to.projectId))) {
+        // The rest are still waiting for a person's answer on the host's card.
+        if (!projects.has(projectId)) continue;
+        const problem = await deliverAsks(threadId, projectId, invocation);
+        if (problem) problems.push(problem);
+      }
+    } catch (error) {
+      problems.push(error?.message ?? "The message could not be sent.");
+    }
+    return problems;
+  };
+
+  const unsentNote = (problem) =>
+    `Your message to another project hasn't gone out: ${problem} It is kept and retried with your next accepted ask-project or reply-project. To send it now, call ask-project again with the same projectId, message and operationId once that's sorted.`;
+
+  /** The same, for a result the agent reads. */
+  const retryNote = async (threadId, invocation, skipProjectId) => {
+    const [problem] = await retryAsks(threadId, invocation, skipProjectId);
+    return problem ? ` ${unsentNote(problem)}` : "";
+  };
+
+  /** A plain note in a plugin-owned conversation, for what the agent can't see any other way. */
+  const nudge = async (threadId, text) => {
+    try {
+      await ctx.threads.send({
+        threadId,
+        text,
+        idempotencyKey: `note-${hashId(threadId, text)}`,
+      });
+    } catch (error) {
+      ctx.log("warn", `Could not leave a note: ${error?.message}`);
+    }
+  };
+
   const coordinatorAction = async (_input, invocation) => {
     // A project in context wins: the sidebar names the project its row belongs to, while the
     // open thread may be in another one. The palette falls back to the open thread's project.
@@ -349,6 +549,12 @@ export function activate(ctx) {
       invocation,
     );
     if (problem) return { message: PROBLEMS[problem] };
+    await serial(pruneStored);
+    // A person acting in the conversation can send on its behalf; the agent hears if that fails.
+    if (context.threadId === threadId) {
+      const [failed] = await serial(() => retryAsks(threadId, invocation));
+      if (failed) await nudge(threadId, unsentNote(failed));
+    }
     // Like a new project in Claude Code Projects, the Overview is open the first time only.
     return {
       intents: [
@@ -394,15 +600,312 @@ export function activate(ctx) {
     };
   });
 
+  const askProject = async (from, projectId, text, invocation) => {
+    // Agents reuse the operation id when retrying, so the same call never sends a second message.
+    const id = hashId(from.id, invocation.operationId).slice(0, 16);
+    const digest = hashId(text);
+    const store = await readHandoffs();
+    const repeated = repeatedAsk(store, { id, digest, projectId });
+    if (!repeated && askUsedRecently(store, id))
+      return {
+        message:
+          "That operationId was already used and its ask is gone, so nothing was sent. If it still matters, use a new operationId.",
+        data: { status: "used" },
+      };
+    // A retry of a counted ask isn't a new one, so it still goes through.
+    if (!repeated && askQuotaSpent(store, from.projectId, projectId))
+      return {
+        message: `This project has already asked that project ${HANDOFF_LIMITS.asksPerHour} times in the last hour, so nothing was sent. Stop here and tell the person.`,
+        data: { status: "limited" },
+      };
+    if (repeated?.status === "sent")
+      return {
+        message: `That message already went out. Its reply arrives in this conversation; end your turn.${await retryNote(from.id, invocation)}`,
+        data: { handoffId: repeated.id, status: "sent" },
+      };
+    if (repeated && isUndelivered(repeated) && !keepsPlace(repeated))
+      return {
+        message:
+          "This ask is over a week old and was never confirmed, so it may have arrived and nothing was sent. If it's still needed, ask again with a new operationId.",
+        data: { handoffId: repeated.id, status: "stale" },
+      };
+    // Before the host hears of it: past 64 requests it drops its oldest unanswered one, so an ask
+    // refused here must not cost a real card its place.
+    if (
+      (!repeated || !isUndelivered(repeated)) &&
+      store.handoffs.filter(
+        (entry) =>
+          isUndelivered(entry) &&
+          keepsPlace(entry) &&
+          entry.from.threadId === from.id,
+      ).length >= HANDOFF_LIMITS.pending
+    )
+      return {
+        // The backlog that fills this limit may be ready to go, so it still gets its retry.
+        message: `Too many asks from this conversation are waiting to go out, so this one wasn't sent. ${DISCARD_HINT}${await retryNote(from.id, invocation)}`,
+        data: { status: "limited" },
+      };
+    if (
+      !repeated &&
+      store.handoffs.filter((entry) => keepsPlace(entry)).length >=
+        HANDOFF_LIMITS.handoffs
+    )
+      return {
+        message: `Too many asks are still unanswered, so nothing was sent. ${DISCARD_HINT}`,
+        data: { status: "limited" },
+      };
+    const { status } = await ctx.projects.requestAccess({
+      projectId,
+      threadId: from.id,
+      actionId: ACCESS_ANSWER,
+    });
+    if (status === "declined") {
+      if (repeated?.status === "pending")
+        await saveHandoff({ ...repeated, status: "declined", text: "" });
+      return {
+        message: `The person said not now to this project, so nothing was sent. Tell them plainly. You can ask again once they next write here.${await retryNote(from.id, invocation, projectId)}`,
+        data: { status },
+      };
+    }
+    const handoff = {
+      id,
+      digest,
+      from: { threadId: from.id, projectId: from.projectId },
+      to: { projectId, threadId: null },
+      reply: null,
+      ...repeated,
+      // Asking again after it expired or was declined starts its day over.
+      createdAt:
+        repeated && isUndelivered(repeated)
+          ? repeated.createdAt
+          : new Date().toISOString(),
+      status: repeated?.status === "sending" ? "sending" : "pending",
+      noted: false,
+      text,
+    };
+    await ctx.storage.set(
+      HANDOFFS,
+      repeated ? putHandoff(store, handoff) : recordAsk(store, handoff),
+    );
+    await invalidate(HANDOFF_TOPICS);
+    // The row is the agent's result, so it exists from the first call and follows the handoff.
+    const row = async () => {
+      if (repeated) return {};
+      const { projects } = await listProjects(invocation, { calls: 2 });
+      return {
+        card: {
+          viewId: ASKED,
+          summary: `Asked ${projects.get(projectId)?.title ?? "another project"}`,
+          data: { handoffId: handoff.id },
+        },
+      };
+    };
+    if (status === "pending")
+      return {
+        message: `The person needs to add this project first; T3 shows them a card here. The message is kept and goes out when they approve. Tell them plainly which project you need and why, then end your turn.${await retryNote(from.id, invocation, projectId)}`,
+        data: { handoffId: handoff.id, status },
+        ...(await row()),
+      };
+    const problem = await deliverAsks(from.id, projectId, invocation);
+    const others = await retryNote(from.id, invocation, projectId);
+    await invalidate(HANDOFF_TOPICS);
+    // The problem may be an older attempt's, which this ask went past.
+    const sent = (await readHandoffs()).handoffs.some(
+      (entry) => entry.id === handoff.id && entry.status === "sent",
+    );
+    return {
+      message: [
+        sent && "Sent. The reply arrives in this conversation; end your turn.",
+        problem && unsentNote(problem),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .concat(others),
+      data: { handoffId: handoff.id, status: sent ? "sent" : "pending" },
+      ...(await row()),
+    };
+  };
+
+  ctx.handle("action:ask-project", (input, invocation) =>
+    serial(async () => {
+      const { caller } = invocation;
+      const from =
+        caller.kind === "agent" && caller.threadId
+          ? await ctx.threads.metadata({ threadId: caller.threadId })
+          : null;
+      const coordinators = await readCoordinators();
+      if (!from || coordinators.projects[from.projectId]?.threadId !== from.id)
+        throw new Error(
+          "Only a project's main conversation can ask another project.",
+        );
+      const text = handoffText(input?.message);
+      const projectId = input?.projectId;
+      if (typeof projectId !== "string" || !projectId)
+        throw new Error("Name the project with its id from t3_project_list.");
+      if (projectId === from.projectId)
+        throw new Error("That is this project. Delegate the work instead.");
+      await pruneStored();
+      const result = await askProject(from, projectId, text, invocation);
+      return {
+        ...result,
+        message: `${result.message}${await expiredNote(from.id)}`,
+      };
+    }),
+  );
+
+  // The return value goes nowhere, so anything the agent must know travels as a note. The host's
+  // record decides what happened: this input is only the signal to look.
+  ctx.handle(`action:${ACCESS_ANSWER}`, (_input, invocation) =>
+    serial(async () => {
+      const { projectId, threadId } = invocation.context ?? {};
+      if (!projectId || !threadId) return {};
+      await pruneStored();
+      try {
+        const { status } = await ctx.projects.requestAccess({
+          projectId,
+          threadId,
+          actionId: ACCESS_ANSWER,
+        });
+        const waiting = (await readHandoffs()).handoffs.filter(
+          (entry) => isUndelivered(entry) && entry.to.projectId === projectId,
+        );
+        if (status === "declined") {
+          // A `sending` ask may already be there, so it can't be called unsent.
+          for (const handoff of waiting.filter((h) => h.status === "pending")) {
+            await saveHandoff({ ...handoff, status: "declined", text: "" });
+            await nudge(
+              handoff.from.threadId,
+              `The person said not now to the project you asked, so this was not sent: "${messagePreview(handoff.text)}". Tell them plainly. You can ask again once they next write here.`,
+            );
+          }
+        }
+        if (status === "granted") {
+          const problem = await deliverAsks(threadId, projectId, invocation);
+          if (problem) await nudge(threadId, unsentNote(problem));
+          // One request serves a project, but a message only goes out in its own sender's name.
+          const others = new Set(waiting.map((entry) => entry.from.threadId));
+          others.delete(threadId);
+          for (const other of others)
+            await nudge(
+              other,
+              "The project you asked was added. Call ask-project again with the same projectId, message and operationId to send it.",
+            );
+        }
+        const [failed] = await retryAsks(threadId, invocation, projectId);
+        if (failed) await nudge(threadId, unsentNote(failed));
+      } catch (error) {
+        // The grant stands whatever happens here, and only this note tells the agent.
+        await nudge(threadId, unsentNote(error?.message ?? "Something failed."));
+      }
+      await invalidate(HANDOFF_TOPICS);
+      return {};
+    }),
+  );
+
+  ctx.handle("action:reply-project", (input, invocation) =>
+    serial(async () => {
+      const { caller } = invocation;
+      if (caller.kind !== "agent" || !caller.threadId)
+        throw new Error("Replies come from a project's main conversation.");
+      const text = handoffText(input?.message);
+      await pruneStored();
+      // Only a stored handoff addressed to this conversation says where a reply may go. A target
+      // is set just before the first send, so a reply also proves an unconfirmed send arrived.
+      const handoff = (await readHandoffs()).handoffs.find(
+        (entry) =>
+          entry.id === input?.handoffId && entry.to.threadId === caller.threadId,
+      );
+      if (!handoff)
+        throw new Error(
+          "This conversation has no ask with that handoffId to reply to.",
+        );
+      const id = hashId(caller.threadId, invocation.operationId).slice(0, 16);
+      const digest = hashId(text);
+      const { reply } = handoff;
+      const unconfirmed = reply?.status === "sending";
+      if (reply?.id === id && reply.digest === digest && !unconfirmed)
+        return { message: "That reply already went out." };
+      if (reply?.id === id && reply.digest !== digest)
+        throw new Error(
+          "This operationId already sent a different reply. Use a new operationId.",
+        );
+      if (reply && (!unconfirmed || reply.digest !== digest))
+        throw new Error(
+          "You already replied to this ask. Each ask gets one reply.",
+        );
+      const at = new Date().toISOString();
+      const attempt = {
+        ...handoff,
+        status: "sent",
+        text: messagePreview(handoff.text),
+        sentAt: handoff.sentAt ?? at,
+        reply: { id, digest, text, status: "sending", at },
+      };
+      const sent = await sendOnce({
+        unconfirmed,
+        begin: () => saveHandoff(attempt),
+        marker: replyMarker(handoff.id),
+        threadId: handoff.from.threadId,
+        text: replyMessage(text, handoff.id),
+        idempotencyKey: `reply-${handoff.id}`,
+      });
+      if (!sent)
+        return {
+          message:
+            "Couldn't check whether your reply already arrived, so it wasn't sent again. Try once more with the same message.",
+        };
+      await saveHandoff({
+        ...attempt,
+        reply: { id, digest, text: messagePreview(text), at },
+      });
+      const others = await retryNote(caller.threadId, invocation);
+      await invalidate(HANDOFF_TOPICS);
+      return { message: `Reply sent to the project that asked.${others}` };
+    }),
+  );
+
+  ctx.handle(`view:${ASKED}:read`, async (input, invocation) => {
+    // Card data grants nothing: a handoff answers only in the conversation that asked.
+    const threadId = invocation.context?.threadId;
+    const handoff = (await readHandoffs()).handoffs.find(
+      (entry) =>
+        entry.id === input?.handoffId && entry.from.threadId === threadId,
+    );
+    if (!threadId || !handoff) return { data: null };
+    const { projectId } = handoff.to;
+    const { projects } = await listProjects(invocation, { calls: SCAN_PAGES });
+    const project = projects.get(projectId);
+    const { threads } = project
+      ? await listThreads(projectId, invocation, { calls: SCAN_PAGES })
+      : { threads: [] };
+    return { data: askedRow(handoff, project, threads) };
+  });
+
   ctx.handle(`view:${VIEW}:read`, async (_input, invocation) => {
     const { thread, projectId, coordinator } =
       await overviewContext(invocation);
+    // A worker elsewhere opens its launcher's panel, but that project's messages stay with it.
+    const handoffs =
+      coordinator && thread.projectId === projectId
+        ? (await readHandoffs()).handoffs.filter(
+            (entry) => entry.from.threadId === coordinator.id,
+          )
+        : [];
     const [{ notes }, scan] = await Promise.all([
       readMemory(projectId),
       coordinator
-        ? scanAccessible(invocation, { calls: READ_BUDGET }, [projectId])
+        ? scanAccessible(invocation, { calls: READ_BUDGET }, [
+            projectId,
+            ...handoffs.map((entry) => entry.to.projectId),
+          ])
         : listProjects(invocation, { calls: SCAN_PAGES }),
     ]);
+    const others = coordinator
+      ? otherProjects(handoffs, coordinator.id, scan.threads, scan.projects)
+      : [];
+    const threadsView = coordinator
+      ? overview(scan.threads, coordinator.id, scan.projects)
+      : null;
     return {
       data: {
         projectId,
@@ -410,12 +913,28 @@ export function activate(ctx) {
         coordinator: coordinator && { threadId: coordinator.id },
         current: thread.id,
         scan: coordinator ? { complete: scan.complete } : null,
-        overview: coordinator
-          ? overview(scan.threads, coordinator.id, scan.projects)
-          : null,
+        overview: threadsView,
+        summary: threadsView && overviewSummary(threadsView.status, others),
+        others,
         notes,
       },
     };
+  });
+
+  // A view can't send, so this only forgets. A reply to a discarded ask is refused.
+  ctx.handle(`view:${VIEW}:discard`, async (input, invocation) => {
+    const { thread, projectId, coordinator } =
+      await overviewContext(invocation);
+    if (coordinator && thread.projectId === projectId)
+      await serial(async () => {
+        await pruneStored();
+        await ctx.storage.set(
+          HANDOFFS,
+          discardAsks(await readHandoffs(), coordinator.id, input?.key),
+        );
+      });
+    await invalidate(HANDOFF_TOPICS);
+    return { data: null };
   });
 
   ctx.handle(`view:${VIEW}:remember`, async (input, invocation) => {

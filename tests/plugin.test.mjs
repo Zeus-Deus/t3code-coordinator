@@ -41,9 +41,10 @@ function host({
   threads = [],
   capabilities = [],
   projectPageSize = 200,
+  storage = new Map(),
 } = {}) {
   const state = {
-    storage: new Map(),
+    storage,
     threads: new Map(threads.map((t) => [t.id, t])),
     created: [],
     unarchived: [],
@@ -53,7 +54,33 @@ function host({
     failedProjects: new Set(),
     threadLists: [],
     projectListingFailsAt: null,
+    sent: [],
+    accessRequests: [],
+    declinedProjects: new Set(),
+    sendError: null,
+    accessError: null,
+    readError: null,
+    writeError: null,
+    crashAfterSend: false,
+    messages: new Map(),
+    reads: [],
+    statusesAtSend: [],
+    statusesAtReply: [],
+    handler: null,
+    caller: null,
+    contextThreadId: null,
   };
+  const denied = () =>
+    Object.assign(new Error("Permission denied."), {
+      reason: "permission_denied",
+    });
+  // The verified sender, as the host resolves it: nobody but an agent or a person's action has one.
+  const sender = () =>
+    state.caller?.kind === "agent"
+      ? state.caller.threadId
+      : state.handler?.startsWith("action:")
+        ? state.contextThreadId
+        : undefined;
   const handlers = new Map();
   let tree;
   const counted =
@@ -69,10 +96,14 @@ function host({
       get: counted(async (key) =>
         structuredClone(state.storage.get(key) ?? null),
       ),
-      set: counted(
-        async (key, value) =>
-          void state.storage.set(key, structuredClone(value)),
-      ),
+      set: counted(async (key, value) => {
+        if (state.writeError) {
+          const error = state.writeError;
+          state.writeError = null;
+          throw error;
+        }
+        state.storage.set(key, structuredClone(value));
+      }),
       delete: counted(async (key) => void state.storage.delete(key)),
     },
     threads: {
@@ -103,10 +134,13 @@ function host({
         if (state.createError) throw state.createError;
         const threadId = `coordinator-${state.created.length + 1}`;
         state.created.push(input);
+        // The host records the caller as the launcher, wherever the new thread lives.
+        const launcher = sender();
         state.threads.set(
           threadId,
           thread(threadId, {
             projectId: input.projectId,
+            ...(launcher ? { launchedFrom: { threadId: launcher } } : {}),
             ...(input.owner
               ? {
                   pluginOwner: {
@@ -127,12 +161,84 @@ function host({
         return { threadId };
       }),
       unarchive: counted(async ({ threadId }) => {
+        if (state.caller?.kind !== "client") throw denied();
         state.unarchived.push(threadId);
         state.threads.get(threadId).archivedAt = null;
         return { threadId };
       }),
+      read: counted(async ({ threadId }) => {
+        if (state.readError) throw state.readError;
+        const target = state.threads.get(threadId);
+        if (!target || target.deleted) throw denied();
+        if (state.deniedProjects.has(target.projectId)) throw denied();
+        state.reads.push(threadId);
+        return {
+          threadId,
+          projectId: target.projectId,
+          title: target.title,
+          messages: (state.messages.get(threadId) ?? [])
+            .slice(-30)
+            .map((m) => ({ ...m, text: m.text.slice(0, 4096) })),
+        };
+      }),
+      send: counted(async (input) => {
+        state.statusesAtReply.push(
+          ...(state.storage.get("handoffs.v1")?.handoffs ?? [])
+            .filter((entry) => input.idempotencyKey === `reply-${entry.id}`)
+            .map((entry) => entry.reply?.status),
+        );
+        state.statusesAtSend.push(
+          ...(state.storage.get("handoffs.v1")?.handoffs ?? [])
+            .filter((entry) => entry.id && input.idempotencyKey === `ask-${entry.id}`)
+            .map((entry) => entry.status),
+        );
+        if (state.sendError) throw state.sendError;
+        if (state.sendFailsOnce) {
+          const error = state.sendFailsOnce;
+          state.sendFailsOnce = null;
+          throw error;
+        }
+        const target = state.threads.get(input.threadId);
+        if (!target || target.deleted) throw denied();
+        if (state.deniedProjects.has(target.projectId)) throw denied();
+        const from = input.fromConversation ? sender() : undefined;
+        if (input.fromConversation) {
+          const source = state.threads.get(from);
+          if (!source || state.deniedProjects.has(source.projectId))
+            throw denied();
+        }
+        if (target.archivedAt) throw new Error("The thread is archived.");
+        state.sent.push({ ...input, senderThreadId: from });
+        // The host's own header, which counts toward what a later read gets back.
+        const title = projects.find(
+          (project) => project.id === state.threads.get(from)?.projectId,
+        )?.title;
+        const header = `[Plugin: Project Coordinator${title === undefined ? "" : `, from project ${JSON.stringify(title.slice(0, 200))}`}]`;
+        state.messages.set(input.threadId, [
+          ...(state.messages.get(input.threadId) ?? []),
+          { id: `m-${state.sent.length}`, role: "user", text: `${header}\n${input.text}` },
+        ]);
+        if (state.crashAfterSend) {
+          state.crashAfterSend = false;
+          state.writeError = new Error("The process died.");
+        }
+        return { threadId: input.threadId, runId: "run", delivery: "started" };
+      }),
     },
     projects: {
+      requestAccess: counted(async (request) => {
+        if (!state.caller || state.handler?.startsWith("view:")) throw denied();
+        if (!state.threads.get(request.threadId)?.pluginOwner) throw denied();
+        if (state.accessError) throw state.accessError;
+        state.accessRequests.push(request);
+        if (!state.deniedProjects.has(request.projectId))
+          return { status: "granted" };
+        return {
+          status: state.declinedProjects.has(request.projectId)
+            ? "declined"
+            : "pending",
+        };
+      }),
       list: counted(async ({ cursor = 0, limit }) => {
         NodeAssert.ok(limit <= 200);
         if (cursor === state.projectListingFailsAt)
@@ -155,7 +261,12 @@ function host({
   return {
     state,
     handlers,
-    invoke: (name, input, invocation) => handlers.get(name)(input, invocation),
+    invoke: async (name, input, invocation) => {
+      state.handler = name;
+      state.caller = invocation?.caller ?? null;
+      state.contextThreadId = invocation?.context?.threadId;
+      return handlers.get(name)(input, invocation);
+    },
     tree: () => tree({ signal: new AbortController().signal }),
   };
 }
@@ -344,7 +455,12 @@ NodeTest.test(
       (match) => match[1],
     );
     const h = host();
-    NodeAssert.deepEqual(names.toSorted(), ["forget", "read", "remember"]);
+    NodeAssert.deepEqual(names.toSorted(), [
+      "discard",
+      "forget",
+      "read",
+      "remember",
+    ]);
     for (const name of names) {
       // The client bridge prefixes `view:<id>:` itself and rejects any other shape.
       NodeAssert.match(name, /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/);
@@ -867,4 +983,1615 @@ NodeTest.test("the panel shows working projects, accessible scope, partial count
   await refresh();
   NodeAssert.equal(elements.get("no-threads").hidden, true);
   NodeAssert.equal(elements.get("partial").hidden, false);
+});
+
+const HANDOFF_CAPABILITIES = [
+  "ui.native-tree-conversations",
+  "ui.native-tree-projects",
+];
+
+/** Shelf has a coordinator (coordinator-1); the plugin holds Atlas only once a person adds it. */
+async function askingHost() {
+  const h = host({
+    projects: [
+      { id: "p", title: "Shelf" },
+      { id: "q", title: "Atlas" },
+      { id: "r", title: "Harbor" },
+    ],
+    capabilities: HANDOFF_CAPABILITIES,
+  });
+  await h.invoke("action:new-project", {}, personIn({ projectId: "p" }));
+  h.state.deniedProjects.add("q");
+  return h;
+}
+const createdInAtlas = (h) =>
+  h.state.created.filter((request) => request.projectId === "q");
+const personIn = (context) => ({ ...client(), context });
+const ask = (h, input = {}, invocation = agent("coordinator-1")) =>
+  h.invoke(
+    "action:ask-project",
+    { projectId: "q", message: "Please add a health check.", ...input },
+    invocation,
+  );
+/** What the host does when a person answers its card. */
+const answer = (h, decision, projectId = "q", threadId = "coordinator-1") => {
+  if (decision === "granted") h.state.deniedProjects.delete(projectId);
+  else h.state.declinedProjects.add(projectId);
+  return h.invoke(
+    "action:project-access",
+    { projectAccess: decision },
+    personIn({ projectId, threadId }),
+  );
+};
+const row = async (h, handoffId, threadId = "coordinator-1") =>
+  (await h.invoke("view:asked:read", { handoffId }, client(threadId))).data;
+const panel = async (h, threadId = "coordinator-1") =>
+  (await h.invoke("view:overview:read", {}, client(threadId))).data;
+const asked = (h) => h.state.sent.filter((m) => m.fromConversation);
+const notes = (h) => h.state.sent.filter((m) => !m.fromConversation);
+/** Grants Atlas and sends one message, leaving Atlas's new conversation as `target`. */
+async function delivered(h, input) {
+  h.state.deniedProjects.delete("q");
+  const result = await ask(h, input);
+  return { handoffId: result.data.handoffId, target: asked(h).at(-1).threadId };
+}
+
+NodeTest.test(
+  "a message waits for the person's Add, then opens the project's conversation as the asker",
+  async () => {
+    const h = await askingHost();
+    const result = await ask(h);
+    NodeAssert.equal(result.data.status, "pending");
+    NodeAssert.match(result.message, /card/);
+    NodeAssert.deepEqual(h.state.sent, []);
+    NodeAssert.deepEqual(createdInAtlas(h), []);
+    NodeAssert.deepEqual(h.state.accessRequests, [
+      {
+        projectId: "q",
+        threadId: "coordinator-1",
+        actionId: "project-access",
+      },
+    ]);
+    // The row is there from the first call, and names nothing the plugin can't read yet.
+    NodeAssert.equal(result.card.viewId, "asked");
+    NodeAssert.equal(result.card.summary, "Asked another project");
+    const { handoffId } = result.card.data;
+    NodeAssert.deepEqual(await row(h, handoffId), {
+      title: "Asked another project",
+      threadId: null,
+      state: "sent",
+      label: "Waiting for access",
+    });
+
+    await answer(h, "granted");
+    const [created] = createdInAtlas(h);
+    NodeAssert.equal(createdInAtlas(h).length, 1);
+    NodeAssert.equal(created.projectId, "q");
+    NodeAssert.equal(created.title, "Atlas");
+    NodeAssert.equal(created.owner, "tree:projects");
+    const [sent] = h.state.sent;
+    NodeAssert.equal(h.state.sent.length, 1);
+    NodeAssert.equal(sent.fromConversation, true);
+    NodeAssert.equal(sent.senderThreadId, "coordinator-1");
+    NodeAssert.match(sent.text, /^Please add a health check\./);
+    NodeAssert.match(sent.text, new RegExp(`handoffId "${handoffId}"`));
+    // A plugin's message doesn't carry the brief, so the guide is named here.
+    NodeAssert.match(sent.text, /coordinator guide/);
+    NodeAssert.deepEqual(await row(h, handoffId), {
+      title: "Asked Atlas",
+      threadId: sent.threadId,
+      state: "sent",
+      label: "Sent",
+    });
+    NodeAssert.ok(h.state.invalidated.includes("view:asked"));
+    NodeAssert.ok(h.state.invalidated.includes("tree:projects"));
+    // The person's answer needs no note: the row moved and the reply will arrive here.
+    NodeAssert.deepEqual(notes(h), []);
+  },
+);
+
+NodeTest.test("a project the plugin already holds gets the message at once", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  const result = await ask(h);
+  NodeAssert.equal(result.data.status, "sent");
+  NodeAssert.equal(result.card.summary, "Asked Atlas");
+  NodeAssert.equal(asked(h)[0].senderThreadId, "coordinator-1");
+});
+
+NodeTest.test(
+  "Not now keeps the message out of the project and tells the agent plainly",
+  async () => {
+    const h = await askingHost();
+    await ask(h);
+    await answer(h, "declined");
+    NodeAssert.deepEqual(asked(h), []);
+    NodeAssert.deepEqual(createdInAtlas(h), []);
+    // Woken with a plain note: the sender label is only for messages between projects.
+    NodeAssert.equal(notes(h).length, 1);
+    NodeAssert.equal(notes(h)[0].threadId, "coordinator-1");
+    NodeAssert.match(notes(h)[0].text, /not now/);
+    NodeAssert.match(notes(h)[0].text, /Tell them plainly/);
+
+    const repeat = await ask(h);
+    NodeAssert.match(repeat.message, /said not now/);
+    NodeAssert.equal(repeat.data.status, "declined");
+    NodeAssert.equal(repeat.card, undefined);
+    NodeAssert.equal(asked(h).length, 0);
+
+    // Once the person writes again the host opens the question, and the same ask works.
+    h.state.declinedProjects.delete("q");
+    const again = await ask(h);
+    NodeAssert.equal(again.data.status, "pending");
+    await answer(h, "granted");
+    NodeAssert.equal(asked(h).length, 1);
+  },
+);
+
+NodeTest.test(
+  "the row and the store forget a declined message",
+  async () => {
+    const h = await askingHost();
+    const { card } = await ask(h);
+    await answer(h, "declined");
+    NodeAssert.equal((await row(h, card.data.handoffId)).label, "Not added");
+    NodeAssert.doesNotMatch(
+      JSON.stringify(h.state.storage.get("handoffs.v1")),
+      /health check/,
+    );
+  },
+);
+
+NodeTest.test("repeating an operationId adds no card and no second message", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "same");
+  const first = await ask(h, {}, invocation);
+  const second = await ask(h, {}, invocation);
+  NodeAssert.equal(second.data.handoffId, first.data.handoffId);
+  NodeAssert.equal(second.card, undefined);
+  await answer(h, "granted");
+  const third = await ask(h, {}, invocation);
+  NodeAssert.match(third.message, /already went out/);
+  NodeAssert.equal(third.card, undefined);
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test("the same words under a new operationId are a new request", async () => {
+  const h = await askingHost();
+  const first = await ask(h);
+  const second = await ask(h);
+  NodeAssert.notEqual(second.data.handoffId, first.data.handoffId);
+  NodeAssert.ok(second.card);
+  await answer(h, "granted");
+  NodeAssert.equal(asked(h).length, 2);
+  // Identical text after that goes out too: the earlier one is still unanswered.
+  await ask(h);
+  NodeAssert.equal(asked(h).length, 3);
+});
+
+NodeTest.test("different waiting messages go out in order, once", async () => {
+  const h = await askingHost();
+  await ask(h, { message: "First." });
+  await ask(h, { message: "Second." });
+  await answer(h, "granted");
+  NodeAssert.deepEqual(
+    asked(h).map((m) => m.text.split("\n")[0]),
+    ["First.", "Second."],
+  );
+  NodeAssert.equal(createdInAtlas(h).length, 1);
+});
+
+NodeTest.test("an operationId sends once and can't change its message", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  const invocation = agent("coordinator-1", "retry");
+  const first = await ask(h, {}, invocation);
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.equal(retry.data.handoffId, first.data.handoffId);
+  NodeAssert.equal(asked(h).length, 1);
+  await NodeAssert.rejects(
+    ask(h, { message: "Something else." }, invocation),
+    /already asked something else/,
+  );
+  await NodeAssert.rejects(
+    ask(h, { projectId: "r" }, invocation),
+    /already asked something else/,
+  );
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test(
+  "a failed send keeps the message for a retry that delivers it once",
+  async () => {
+    const h = await askingHost();
+    h.state.deniedProjects.delete("q");
+    h.state.sendError = new Error("The plugin could not send to the thread.");
+    const invocation = agent("coordinator-1", "flaky");
+    const first = await ask(h, {}, invocation);
+    NodeAssert.equal(first.data.status, "pending");
+    NodeAssert.match(first.message, /hasn't gone out/);
+    NodeAssert.equal(
+      (await row(h, first.data.handoffId)).label,
+      "Not delivered yet",
+    );
+    h.state.sendError = null;
+    const retry = await ask(h, {}, invocation);
+    NodeAssert.equal(retry.data.status, "sent");
+    NodeAssert.equal(asked(h).length, 1);
+    NodeAssert.equal(createdInAtlas(h).length, 1);
+  },
+);
+
+NodeTest.test(
+  "a failed delivery after approval wakes the agent, since the answer's return value goes nowhere",
+  async () => {
+    const h = await askingHost();
+    const invocation = agent("coordinator-1", "kept");
+    await ask(h, {}, invocation);
+    h.state.createError = Object.assign(new Error("No model selection."), {
+      reason: "invalid_input",
+    });
+    await answer(h, "granted");
+    NodeAssert.deepEqual(asked(h), []);
+    NodeAssert.equal(notes(h).length, 1);
+    NodeAssert.match(notes(h)[0].text, /hasn't gone out/);
+    NodeAssert.match(notes(h)[0].text, /Settings → Providers/);
+    h.state.createError = null;
+    const retry = await ask(h, {}, invocation);
+    NodeAssert.equal(retry.data.status, "sent");
+    NodeAssert.equal(asked(h).length, 1);
+  },
+);
+
+/** Stops the process at the worst moment: the host took the message, the plugin never saved that. */
+async function lostAfterSend(h, invocation) {
+  await ask(h, {}, invocation);
+  h.state.crashAfterSend = true;
+  await answer(h, "granted");
+  const [handoff] = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(handoff.status, "sending");
+  NodeAssert.equal(asked(h).length, 1);
+  return handoff;
+}
+
+NodeTest.test("an ask is marked sending before the send, not after", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  await ask(h);
+  NodeAssert.deepEqual(h.state.statusesAtSend, ["sending"]);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sent");
+  // A first send has nothing to check for.
+  NodeAssert.deepEqual(h.state.reads, []);
+});
+
+NodeTest.test(
+  "a fault between send and save doesn't send twice on the agent's retry",
+  async () => {
+    const h = await askingHost();
+    const invocation = agent("coordinator-1", "lost");
+    const { to } = await lostAfterSend(h, invocation);
+    // Told, but still undelivered, so it shows.
+    NodeAssert.match(notes(h)[0].text, /hasn't gone out: The process died\./);
+    NodeAssert.equal((await panel(h)).others[0].state, "undelivered");
+
+    // A fresh invocation: the host's own replay protection doesn't cover this.
+    const retry = await ask(h, {}, { ...invocation, operationId: "lost" });
+    NodeAssert.equal(retry.data.status, "sent");
+    NodeAssert.deepEqual(h.state.reads, [to.threadId]);
+    NodeAssert.equal(asked(h).length, 1);
+    NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sent");
+    NodeAssert.equal((await panel(h)).others[0].state, "sent");
+  },
+);
+
+NodeTest.test("the same fault is safe through every retry path", async () => {
+  const h = await askingHost();
+  await lostAfterSend(h);
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sent");
+
+  const other = await askingHost();
+  await other.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  await lostAfterSend(other);
+  await ask(other, { projectId: "r", message: "Hello Harbor." });
+  NodeAssert.equal(asked(other).filter((m) => /health check/.test(m.text)).length, 1);
+});
+
+NodeTest.test("an ask past its week isn't retried with a later delivery", async () => {
+  const h = await askingHost();
+  await lostAfterSend(h, agent("coordinator-1", "aged"));
+  const [aged] = h.state.storage.get("handoffs.v1").handoffs;
+  aged.createdAt = new Date(Date.now() - 8 * 86_400_000).toISOString();
+  // It never arrived, so a retry would have sent it.
+  h.state.sent.length = 0;
+  h.state.messages.clear();
+  const later = await ask(h, { message: "A later ask." });
+  NodeAssert.equal(later.data.status, "sent");
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.match(asked(h)[0].text, /^A later ask\./);
+});
+
+NodeTest.test("retrying an ask past its week says so and sends nothing", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "aged-retry");
+  await lostAfterSend(h, invocation);
+  const [aged] = h.state.storage.get("handoffs.v1").handoffs;
+  aged.createdAt = new Date(Date.now() - 8 * 86_400_000).toISOString();
+  const sends = h.state.sent.length;
+  const result = await ask(h, {}, invocation);
+  NodeAssert.equal(result.data.status, "stale");
+  NodeAssert.match(result.message, /new operationId/);
+  NodeAssert.equal(h.state.sent.length, sends);
+});
+
+NodeTest.test("an attempt of unknown outcome doesn't hold up later asks", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "unknown-first");
+  await lostAfterSend(h, invocation);
+  h.state.readError = new Error("The host is busy.");
+  const later = await ask(h, { message: "A later ask." });
+  NodeAssert.equal(later.data.status, "sent");
+  NodeAssert.match(later.message, /^Sent\./);
+  NodeAssert.match(later.message, /Couldn't check whether it already arrived/);
+  NodeAssert.equal(asked(h).length, 2);
+  const stored = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.deepEqual(stored.map((h) => h.status), ["sending", "sent"]);
+  // It stays on the list, and clears once the conversation can be read.
+  h.state.readError = null;
+  await ask(h, { message: "Another." });
+  NodeAssert.equal(asked(h).length, 3);
+  NodeAssert.deepEqual(
+    h.state.storage.get("handoffs.v1").handoffs.map((h) => h.status),
+    ["sent", "sent", "sent"],
+  );
+});
+
+NodeTest.test("a failed resend of an unknown attempt doesn't hold up later asks", async () => {
+  const h = await askingHost();
+  await ask(h);
+  h.state.sendError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.sendError = null;
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sending");
+  // Read, not there, and the resend fails: the next ask still goes out.
+  h.state.sendFailsOnce = new Error("Still busy.");
+  const later = await ask(h, { message: "A later ask." });
+  NodeAssert.equal(later.data.status, "sent");
+  NodeAssert.match(later.message, /Still busy\./);
+  NodeAssert.deepEqual(
+    asked(h).map((m) => m.text.split("\n")[0]),
+    ["A later ask."],
+  );
+});
+
+NodeTest.test("a reply proves an attempt of unknown outcome arrived", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "proved");
+  const { id, to } = await lostAfterSend(h, invocation);
+  await h.invoke(
+    "action:reply-project",
+    { handoffId: id, message: "It got here." },
+    agent(to.threadId),
+  );
+  const [handoff] = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(handoff.status, "sent");
+  NodeAssert.ok(handoff.sentAt);
+  NodeAssert.equal((await panel(h)).others[0].state, "replied");
+  NodeAssert.deepEqual(h.state.reads, []);
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.match(retry.message, /already went out/);
+  NodeAssert.deepEqual(h.state.reads, []);
+  NodeAssert.equal(asked(h).filter((m) => /health check/.test(m.text)).length, 1);
+});
+
+NodeTest.test("a send that never happened goes out on the retry", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "unsent");
+  await ask(h, {}, invocation);
+  h.state.sendError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.sendError = null;
+  NodeAssert.deepEqual(asked(h), []);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sending");
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.equal(retry.data.status, "sent");
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.reads.length, 1);
+});
+
+NodeTest.test("if the target can't be read, nothing is sent and the agent hears why", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "unreadable");
+  await lostAfterSend(h, invocation);
+  h.state.readError = new Error("The host is busy.");
+  const blocked = await ask(h, {}, invocation);
+  NodeAssert.equal(blocked.data.status, "pending");
+  NodeAssert.match(blocked.message, /Couldn't check whether it already arrived/);
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sending");
+  NodeAssert.equal((await panel(h)).others[0].state, "undelivered");
+  h.state.readError = null;
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.equal(retry.data.status, "sent");
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test("a full page of messages can't prove an ask isn't further back", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "buried");
+  const { to } = await lostAfterSend(h, invocation);
+  h.state.messages.set(
+    to.threadId,
+    Array.from({ length: 30 }, (_, i) => ({ id: `n${i}`, role: "user", text: "Busy." })),
+  );
+  const blocked = await ask(h, {}, invocation);
+  NodeAssert.match(blocked.message, /Couldn't check whether it already arrived/);
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test("only the delivered message counts, not an agent quoting the id", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "quoted");
+  const { id, to } = await lostAfterSend(h, invocation);
+  h.state.messages.set(to.threadId, [
+    { id: "a", role: "assistant", text: `I saw handoffId "${id}" somewhere.` },
+  ]);
+  await ask(h, {}, invocation);
+  NodeAssert.equal(asked(h).length, 2);
+});
+
+NodeTest.test("a conversation replaced after a lost send gets the message", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "replaced");
+  const { to } = await lostAfterSend(h, invocation);
+  h.state.threads.get(to.threadId).deleted = true;
+  const retry = await ask(h, {}, invocation);
+  NodeAssert.equal(retry.data.status, "sent");
+  NodeAssert.deepEqual(h.state.reads, []);
+  NodeAssert.notEqual(asked(h).at(-1).threadId, to.threadId);
+  NodeAssert.equal(createdInAtlas(h).length, 2);
+});
+
+NodeTest.test("Not now doesn't call a send of unknown outcome unsent", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "unknown");
+  await lostAfterSend(h, invocation);
+  h.state.deniedProjects.add("q");
+  h.state.declinedProjects.add("q");
+  const result = await ask(h, {}, invocation);
+  NodeAssert.equal(result.data.status, "declined");
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "sending");
+});
+
+NodeTest.test("the footer survives the host's read at the longest message and title", async () => {
+  const title = `"${"\"".repeat(198)}"`;
+  const h = host({
+    projects: [
+      { id: "p", title },
+      { id: "q", title: "Atlas" },
+    ],
+    capabilities: HANDOFF_CAPABILITIES,
+  });
+  await h.invoke("action:new-project", {}, personIn({ projectId: "p" }));
+  h.state.deniedProjects.add("q");
+  const invocation = agent("coordinator-1", "longest");
+  await ask(h, { message: "x".repeat(3000) }, invocation);
+  h.state.crashAfterSend = true;
+  await answer(h, "granted");
+  await ask(h, { message: "x".repeat(3000) }, invocation);
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.reads.length, 1);
+});
+
+/** An approved ask the host failed to deliver: the grant stands, and it is still undelivered. */
+async function stranded(h) {
+  const { card } = await ask(h);
+  h.state.createError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.createError = null;
+  return card.data.handoffId;
+}
+
+NodeTest.test(
+  "a host failure in the approval callback leaves the ask pending, shown, and the agent told",
+  async () => {
+    const h = await askingHost();
+    const handoffId = await stranded(h);
+    NodeAssert.deepEqual(asked(h), []);
+    NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "pending");
+    NodeAssert.equal(notes(h).length, 1);
+    NodeAssert.equal(notes(h)[0].threadId, "coordinator-1");
+    NodeAssert.match(notes(h)[0].text, /hasn't gone out: The host is busy\./);
+
+    const [other] = (await panel(h)).others;
+    NodeAssert.equal(other.project, "Atlas");
+    NodeAssert.equal(other.state, "undelivered");
+    NodeAssert.equal(other.threadId, null);
+    NodeAssert.equal(other.preview, "Not delivered yet: Please add a health check.");
+    NodeAssert.deepEqual(other.history, [
+      { who: "Not delivered yet", text: "Please add a health check." },
+    ]);
+    NodeAssert.equal((await panel(h)).summary, "No workers yet");
+    NodeAssert.deepEqual(await row(h, handoffId), {
+      title: "Asked Atlas",
+      threadId: null,
+      state: "undelivered",
+      label: "Not delivered yet",
+    });
+  },
+);
+
+NodeTest.test("a failed access read in the callback is noted the same way", async () => {
+  const h = await askingHost();
+  await ask(h);
+  h.state.accessError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.accessError = null;
+  NodeAssert.equal(notes(h).length, 1);
+  NodeAssert.match(notes(h)[0].text, /hasn't gone out/);
+  await ask(h, { projectId: "r", message: "Hello." });
+  NodeAssert.ok(asked(h).some((m) => /health check/.test(m.text)));
+});
+
+NodeTest.test("reads never send a stranded ask", async () => {
+  const h = await askingHost();
+  const handoffId = await stranded(h);
+  await panel(h);
+  await row(h, handoffId);
+  await h.invoke("status:overview", {}, client("coordinator-1"));
+  await h.tree();
+  NodeAssert.deepEqual(asked(h), []);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].status, "pending");
+});
+
+NodeTest.test("the next ask-project delivers a stranded ask, once and in order", async () => {
+  const h = await askingHost();
+  await stranded(h);
+  await ask(h, { projectId: "r", message: "Hello Harbor." });
+  await ask(h, { projectId: "r", message: "Hello again." });
+  NodeAssert.deepEqual(
+    asked(h).map((m) => m.text.split("\n")[0]),
+    ["Hello Harbor.", "Please add a health check.", "Hello again."],
+  );
+  NodeAssert.equal((await panel(h)).others.find((o) => o.project === "Atlas").state, "sent");
+});
+
+NodeTest.test("the next reply delivers a stranded ask", async () => {
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((t) => t.projectId === "r");
+  const { data } = await ask(h, { projectId: "r", message: "Hello Harbor." });
+  await stranded(h);
+  NodeAssert.equal(asked(h).length, 1);
+  // Harbor answers Shelf's ask with its own ask to Atlas stuck behind a failure.
+  h.state.deniedProjects.add("q");
+  await ask(h, { projectId: "q", message: "From Harbor." }, agent(harbor.id));
+  h.state.deniedProjects.delete("q");
+  h.state.sendError = new Error("The host is busy.");
+  await answer(h, "granted", "q", harbor.id);
+  h.state.sendError = null;
+  const from = asked(h).length;
+  await h.invoke(
+    "action:reply-project",
+    { handoffId: data.handoffId, message: "Done." },
+    agent(harbor.id),
+  );
+  NodeAssert.deepEqual(
+    asked(h).slice(from).map((m) => m.text.split("\n")[0]),
+    ["Done.", "From Harbor."],
+  );
+  NodeAssert.equal(asked(h).at(-1).senderThreadId, harbor.id);
+});
+
+NodeTest.test("a person's action in the conversation delivers a stranded ask as that conversation", async () => {
+  const h = await askingHost();
+  await stranded(h);
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(asked(h)[0].senderThreadId, "coordinator-1");
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(asked(h).length, 1);
+});
+
+NodeTest.test("a person's action elsewhere can't send in that conversation's name", async () => {
+  const h = await askingHost();
+  await stranded(h);
+  await h.invoke("action:new-project", {}, personIn({ projectId: "p" }));
+  NodeAssert.deepEqual(asked(h), []);
+});
+
+NodeTest.test("a failed retry from a person's action wakes the agent", async () => {
+  const h = await askingHost();
+  await stranded(h);
+  const before = notes(h).length;
+  h.state.createError = new Error("Still busy.");
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(notes(h).length, before + 1);
+  NodeAssert.match(notes(h).at(-1).text, /Still busy\./);
+});
+
+NodeTest.test("a failed retry is in the result of the agent's own call", async () => {
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  await stranded(h);
+  h.state.createError = new Error("Still busy.");
+  const result = await ask(h, { projectId: "r", message: "Hello." });
+  NodeAssert.equal(result.data.status, "sent");
+  NodeAssert.match(result.message, /Still busy\./);
+});
+
+NodeTest.test(
+  "the host's record decides, so a wrong answer input grants nothing",
+  async () => {
+    const h = await askingHost();
+    await ask(h);
+    // Still ungranted on the host, whatever the input claims.
+    await h.invoke(
+      "action:project-access",
+      { projectAccess: "granted" },
+      personIn({ projectId: "q", threadId: "coordinator-1" }),
+    );
+    NodeAssert.deepEqual(h.state.sent, []);
+  },
+);
+
+NodeTest.test(
+  "another conversation's message waits for its own sender after the answer",
+  async () => {
+    const h = await askingHost();
+    await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+    const other = [...h.state.threads.values()].find((t) => t.projectId === "r");
+    const harbor = agent(other.id, "from-harbor");
+    await ask(h, { message: "From Harbor." }, harbor);
+    await ask(h, { message: "From Shelf." });
+    // The host moved the one request to the conversation that asked last.
+    await answer(h, "granted");
+    NodeAssert.equal(asked(h).length, 1);
+    NodeAssert.match(asked(h)[0].text, /^From Shelf\./);
+    NodeAssert.equal(asked(h)[0].senderThreadId, "coordinator-1");
+    NodeAssert.equal(notes(h).length, 1);
+    NodeAssert.equal(notes(h)[0].threadId, other.id);
+    NodeAssert.match(notes(h)[0].text, /same projectId, message and operationId/);
+    await ask(h, { message: "From Harbor." }, harbor);
+    NodeAssert.equal(asked(h).at(-1).senderThreadId, other.id);
+  },
+);
+
+NodeTest.test(
+  "asks keep one conversation per project, through archived and deleted ones",
+  async () => {
+    const h = await askingHost();
+    const { target } = await delivered(h);
+    await ask(h, { message: "Second." });
+    NodeAssert.equal(createdInAtlas(h).length, 1);
+    NodeAssert.equal(asked(h)[1].threadId, target);
+
+    // Only a person can restore a thread, so the agent is told who has to.
+    h.state.threads.get(target).archivedAt = "2026-10-25T01:00:00Z";
+    const invocation = agent("coordinator-1", "archived");
+    const blocked = await ask(h, { message: "Third." }, invocation);
+    NodeAssert.equal(blocked.data.status, "pending");
+    NodeAssert.match(blocked.message, /New project/);
+    NodeAssert.equal(createdInAtlas(h).length, 1);
+    NodeAssert.deepEqual(h.state.unarchived, []);
+
+    await h.invoke("action:new-project", {}, personIn({ projectId: "q" }));
+    NodeAssert.deepEqual(h.state.unarchived, [target]);
+    await ask(h, { message: "Third." }, invocation);
+    NodeAssert.equal(asked(h)[2].threadId, target);
+
+    h.state.threads.get(target).deleted = true;
+    await ask(h, { message: "Fourth." });
+    NodeAssert.equal(createdInAtlas(h).length, 2);
+    NodeAssert.notEqual(asked(h)[3].threadId, target);
+  },
+);
+
+NodeTest.test("an approval restores an archived conversation rather than duplicating it", async () => {
+  const h = await askingHost();
+  const { target } = await delivered(h);
+  h.state.threads.get(target).archivedAt = "2026-10-25T01:00:00Z";
+  h.state.deniedProjects.add("q");
+  await ask(h, { message: "Back again." });
+  await answer(h, "granted");
+  NodeAssert.deepEqual(h.state.unarchived, [target]);
+  NodeAssert.equal(createdInAtlas(h).length, 1);
+  NodeAssert.equal(asked(h).at(-1).threadId, target);
+});
+
+NodeTest.test("only a project's main conversation asks, about another project", async () => {
+  const h = await askingHost();
+  h.state.threads.set(
+    "worker",
+    delegated("worker", "coordinator-1", { projectId: "p" }),
+  );
+  await NodeAssert.rejects(ask(h, {}, agent("worker")), /main conversation/);
+  await NodeAssert.rejects(
+    ask(h, {}, personIn({ threadId: "coordinator-1" })),
+    /main conversation/,
+  );
+  await NodeAssert.rejects(ask(h, { projectId: "p" }), /this project/);
+  await NodeAssert.rejects(ask(h, { projectId: "" }), /Name the project/);
+  await NodeAssert.rejects(ask(h, { message: " " }), /needs text/);
+  await NodeAssert.rejects(
+    ask(h, { message: "x".repeat(3001) }),
+    /under 3000 characters/,
+  );
+  NodeAssert.deepEqual(h.state.accessRequests, []);
+});
+
+NodeTest.test("a full store refuses a new ask rather than lose a reply route", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  const store = h.state.storage.get("handoffs.v1");
+  const [first] = store.handoffs;
+  for (let i = 1; i < 100; i++)
+    store.handoffs.push({ ...first, id: `unanswered-${i}` });
+  const refused = await ask(h, { message: "One more." });
+  NodeAssert.equal(refused.data.status, "limited");
+  NodeAssert.match(refused.message, /still unanswered, so nothing was sent/);
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 100);
+  // The oldest route still works, and its reply frees a place.
+  await h.invoke("action:reply-project", { handoffId, message: "Done." }, agent(target));
+  await ask(h, { message: "One more." });
+  NodeAssert.equal(asked(h).length, 3);
+  const stored = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(stored.length, 100);
+  NodeAssert.ok(!stored.some((entry) => entry.id === handoffId));
+});
+
+NodeTest.test("each direction between two projects gets 10 new asks an hour", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-30T12:00:00Z") });
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((c) => c.projectId === "r");
+  const { target } = await delivered(h);
+  for (let i = 1; i < 10; i++) await ask(h, { message: `Ask ${i}.` });
+  NodeAssert.equal(asked(h).length, 10);
+
+  const before = h.state.accessRequests.length;
+  const invocation = agent("coordinator-1", "over");
+  const over = await ask(h, { message: "Eleven." }, invocation);
+  NodeAssert.equal(over.data.status, "limited");
+  NodeAssert.match(over.message, /nothing was sent/);
+  NodeAssert.match(over.message, /Stop here and tell the person/);
+  NodeAssert.equal(over.card, undefined);
+  NodeAssert.equal(asked(h).length, 10);
+  NodeAssert.equal(h.state.accessRequests.length, before);
+  const count = () => h.state.storage.get("handoffs.v1").handoffs.length;
+  NodeAssert.equal(count(), 10);
+
+  // The other direction and another target have their own count.
+  await ask(h, { projectId: "p", message: "Back." }, agent(target));
+  await ask(h, { projectId: "q", message: "From Harbor." }, agent(harbor.id));
+  NodeAssert.equal(asked(h).length, 12);
+  await ask(h, { projectId: "r", message: "To Harbor." });
+  NodeAssert.equal(asked(h).length, 13);
+
+  // The person writing here doesn't reset it, and a reload keeps it.
+  h.state.threads.get("coordinator-1").latestUserAuthoredMessageAt = new Date().toISOString();
+  const reloaded = host({
+    projects: [
+      { id: "p", title: "Shelf" },
+      { id: "q", title: "Atlas" },
+      { id: "r", title: "Harbor" },
+    ],
+    capabilities: HANDOFF_CAPABILITIES,
+    threads: [...h.state.threads.values()],
+    storage: h.state.storage,
+  });
+  const again = await ask(reloaded, { message: "Twelve." });
+  NodeAssert.equal(again.data.status, "limited");
+  NodeAssert.equal(asked(reloaded).length, 0);
+
+  t.mock.timers.tick(3_600_000);
+  const later = await ask(reloaded, { message: "An hour on." });
+  NodeAssert.equal(later.data.status, "sent");
+  NodeAssert.equal(asked(reloaded).length, 1);
+  // Old entries fall away rather than pile up.
+  const { recentAsks } = reloaded.state.storage.get("handoffs.v1");
+  NodeAssert.ok(recentAsks.every((entry) => Date.now() - entry.at < 3_600_000));
+});
+
+NodeTest.test("a retry of a counted ask isn't a new one", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-30T12:00:00Z") });
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  const invocation = agent("coordinator-1", "tenth");
+  for (let i = 1; i < 10; i++) await ask(h, { message: `Ask ${i}.` });
+  await ask(h, { message: "Ten." }, invocation);
+  const retry = await ask(h, { message: "Ten." }, invocation);
+  NodeAssert.match(retry.message, /already went out/);
+  NodeAssert.equal(asked(h).length, 10);
+});
+
+NodeTest.test("a replay of an evicted ask isn't counted or sent again", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  const invocation = agent("coordinator-1", "evicted");
+  await ask(h, {}, invocation);
+  const store = h.state.storage.get("handoffs.v1");
+  const counted = store.recentAsks.length;
+  store.handoffs.length = 0;
+  const replay = await ask(h, {}, invocation);
+  NodeAssert.equal(replay.data.status, "used");
+  NodeAssert.match(replay.message, /already used and its ask is gone/);
+  NodeAssert.equal(asked(h).length, 1);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").recentAsks.length, counted);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 0);
+});
+
+NodeTest.test("121 alternating asks stop at the bound with no person involved", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-30T12:00:00Z") });
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  await h.invoke("action:reply-project", { handoffId, message: "Ok." }, agent(target));
+  for (let i = 0; i < 120; i++)
+    await ask(
+      h,
+      i % 2
+        ? { message: `Turn ${i}.` }
+        : { projectId: "p", message: `Turn ${i}.` },
+      agent(i % 2 ? "coordinator-1" : target),
+    );
+  const between = asked(h).filter((m) => /^Turn|health check/.test(m.text));
+  NodeAssert.equal(between.length, 20);
+});
+
+const DAY = 86_400_000;
+const NOON = Date.parse("2026-10-30T12:00:00Z");
+/** Asks to ids the host stores but no card ever shows for. */
+async function fillWithBadIds(h) {
+  for (let i = 0; i < 10; i++) {
+    h.state.deniedProjects.add(`bad-${i}`);
+    await ask(h, { projectId: `bad-${i}`, message: `Bad id ${i}.` });
+  }
+}
+
+NodeTest.test("ten bad ids clear themselves after a day, and the agent hears once", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  await fillWithBadIds(h);
+  const blocked = await ask(h);
+  NodeAssert.equal(blocked.data.status, "limited");
+  NodeAssert.match(blocked.message, /tell the person they can discard asks in the Overview/);
+  NodeAssert.doesNotMatch(blocked.message, /\bcards?\b/);
+  NodeAssert.deepEqual(asked(h), []);
+
+  t.mock.timers.tick(DAY);
+  const after = await ask(h);
+  NodeAssert.equal(after.data.status, "sent");
+  NodeAssert.match(after.message, /10 asks of yours expired after a day/);
+  NodeAssert.match(after.message, /"Bad id 9\."/);
+  // One line, on a result it was already reading: no message wakes it.
+  NodeAssert.doesNotMatch(after.message.split("Sent.")[1], /\n/);
+  NodeAssert.deepEqual(notes(h), []);
+  const quiet = await ask(h, { message: "And another." });
+  NodeAssert.doesNotMatch(quiet.message, /expired/);
+});
+
+NodeTest.test("the expired note also reaches a call that's refused", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  h.state.deniedProjects.add("bad");
+  await ask(h, { projectId: "bad", message: "Lost." });
+  t.mock.timers.tick(DAY - 60_000);
+  for (let i = 0; i < 10; i++) await ask(h, { message: `Ask ${i}.` });
+  t.mock.timers.tick(60_000);
+  const refused = await ask(h, { message: "Eleven." });
+  NodeAssert.equal(refused.data.status, "limited");
+  NodeAssert.match(refused.message, /An ask of yours expired after a day/);
+});
+
+NodeTest.test("an ask under a day old stays, and a late approval doesn't send an expired one", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  const { card } = await ask(h);
+  t.mock.timers.tick(DAY - 1);
+  await ask(h, { projectId: "r", message: "Hello." });
+  NodeAssert.equal((await row(h, card.data.handoffId)).label, "Waiting for access");
+  t.mock.timers.tick(1);
+  await answer(h, "granted");
+  NodeAssert.equal(asked(h).filter((m) => /health check/.test(m.text)).length, 0);
+  NodeAssert.equal((await row(h, card.data.handoffId)).label, "Expired");
+  NodeAssert.deepEqual((await panel(h)).others.filter((o) => o.project === "Atlas"), []);
+});
+
+NodeTest.test("a person's action and a reply also expire old asks", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const stale = (h) => h.state.storage.get("handoffs.v1").handoffs.find((e) => e.to.projectId === "bad");
+  const h = await askingHost();
+  h.state.deniedProjects.add("bad");
+  await ask(h, { projectId: "bad", message: "Lost." });
+  t.mock.timers.tick(DAY);
+  await h.invoke("action:coordinator", {}, personIn({ threadId: "coordinator-1" }));
+  NodeAssert.equal(stale(h).status, "expired");
+
+  const other = await askingHost();
+  other.state.deniedProjects.add("bad");
+  const { handoffId, target } = await delivered(other);
+  await ask(other, { projectId: "bad", message: "Lost." });
+  t.mock.timers.tick(DAY);
+  await other.invoke("action:reply-project", { handoffId, message: "Done." }, agent(target));
+  NodeAssert.equal(stale(other).status, "expired");
+});
+
+NodeTest.test("the same operationId after expiry asks again, with a fresh day", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "again");
+  await ask(h, {}, invocation);
+  t.mock.timers.tick(DAY);
+  await ask(h, { projectId: "r", message: "Hello." });
+  const again = await ask(h, {}, invocation);
+  NodeAssert.equal(again.data.status, "pending");
+  t.mock.timers.tick(DAY - 1);
+  await answer(h, "granted");
+  NodeAssert.equal(asked(h).filter((m) => /health check/.test(m.text)).length, 1);
+});
+
+NodeTest.test("expiry leaves a send of unknown outcome alone", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  await lostAfterSend(h);
+  h.state.readError = new Error("The host is busy.");
+  t.mock.timers.tick(7 * DAY);
+  await ask(h, { message: "Much later." });
+  const [first] = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(first.status, "sending");
+  NodeAssert.equal((await panel(h)).others[0].state, "undelivered");
+});
+
+NodeTest.test("the undelivered limit is per asking conversation", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((c) => c.projectId === "r");
+  await fillWithBadIds(h);
+  NodeAssert.equal((await ask(h)).data.status, "limited");
+  const elsewhere = await ask(h, { message: "From Harbor." }, agent(harbor.id));
+  NodeAssert.equal(elsewhere.data.status, "sent");
+});
+
+NodeTest.test("unanswered asks stop holding a place after a week", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  const store = h.state.storage.get("handoffs.v1");
+  const [first] = store.handoffs;
+  for (let i = 1; i < 100; i++)
+    store.handoffs.push({ ...first, id: `unanswered-${i}` });
+  t.mock.timers.tick(7 * DAY - 1);
+  const refused = await ask(h, { message: "Too soon." });
+  NodeAssert.match(refused.message, /tell the person they can discard asks in the Overview/);
+  t.mock.timers.tick(1);
+  const stored = () => h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(stored().length, 100);
+  // Still a working route after the week, until something needs its place.
+  const sent = await ask(h, { message: "After the week." });
+  NodeAssert.equal(sent.data.status, "sent");
+  NodeAssert.equal(stored().length, 100);
+  NodeAssert.ok(!stored().some((entry) => entry.id === handoffId));
+  await NodeAssert.rejects(
+    h.invoke("action:reply-project", { handoffId, message: "Late." }, agent(target)),
+    /no ask with that handoffId/,
+  );
+});
+
+NodeTest.test("an over-quota call delivers nothing, and no note promised it would", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  for (let i = 0; i < 10; i++) await ask(h, { message: `Ask ${i}.` });
+  h.state.createError = new Error("The host is busy.");
+  await answer(h, "granted");
+  h.state.createError = null;
+  NodeAssert.match(notes(h)[0].text, /retried with your next accepted ask-project/);
+  NodeAssert.doesNotMatch(notes(h)[0].text, /goes out with your next/);
+
+  const over = await ask(h, { message: "Eleven." });
+  NodeAssert.equal(over.data.status, "limited");
+  NodeAssert.match(over.message, /asked that project 10 times/);
+  NodeAssert.deepEqual(asked(h), []);
+  // A refusal by the undelivered limit isn't a dead end: the backlog filling it gets its retry.
+  const capped = await ask(h, { projectId: "r", message: "Hello." });
+  NodeAssert.equal(capped.data.status, "limited");
+  NodeAssert.match(capped.message, /this one wasn't sent/);
+  NodeAssert.equal(asked(h).length, 10);
+});
+
+NodeTest.test("the quota message states the limit in force", () => {
+  const source = NodeFs.readFileSync(new URL("../plugin.mjs", import.meta.url), "utf8");
+  NodeAssert.match(source, /asked that project \$\{HANDOFF_LIMITS\.asksPerHour\} times/);
+});
+
+NodeTest.test("waiting messages are bounded", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.add("r");
+  for (let i = 0; i < 10; i++) await ask(h, { message: `Message ${i}.` });
+  const hostRequests = h.state.accessRequests.length;
+  const refused = await ask(h, { projectId: "r", message: "One too many." });
+  NodeAssert.equal(refused.data.status, "limited");
+  NodeAssert.match(refused.message, /Too many asks from this conversation/);
+  // The host never hears of it, so it can't push a real card out of its 64.
+  NodeAssert.equal(h.state.accessRequests.length, hostRequests);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 10);
+});
+
+NodeTest.test(
+  "a reply goes back to the conversation that asked, once, as its sender",
+  async () => {
+    const h = await askingHost();
+    const { handoffId, target } = await delivered(h);
+    const invocation = agent(target, "reply");
+    const reply = { handoffId, message: "The health check is in." };
+    await h.invoke("action:reply-project", reply, invocation);
+    const [, back] = asked(h);
+    NodeAssert.equal(back.threadId, "coordinator-1");
+    NodeAssert.equal(back.senderThreadId, target);
+    NodeAssert.match(back.text, /^The health check is in\./);
+    NodeAssert.match(back.text, /nothing to acknowledge/);
+    NodeAssert.ok(h.state.invalidated.includes("view:overview"));
+
+    // A retry is a no-op; a second reply and a reply to the reply both stop here.
+    await h.invoke("action:reply-project", reply, invocation);
+    NodeAssert.equal(asked(h).length, 2);
+    await NodeAssert.rejects(
+      h.invoke(
+        "action:reply-project",
+        { handoffId, message: "Changed." },
+        invocation,
+      ),
+      /different reply/,
+    );
+    await NodeAssert.rejects(
+      h.invoke("action:reply-project", reply, agent(target)),
+      /one reply/,
+    );
+    await NodeAssert.rejects(
+      h.invoke("action:reply-project", reply, agent("coordinator-1")),
+      /no ask with that handoffId/,
+    );
+    NodeAssert.equal(asked(h).length, 2);
+  },
+);
+
+/** A reply the host took, whose outcome the plugin never saved. */
+async function lostReply(h) {
+  const { handoffId, target } = await delivered(h);
+  const invocation = agent(target, "lost-reply");
+  const reply = { handoffId, message: "It's done." };
+  h.state.crashAfterSend = true;
+  await NodeAssert.rejects(
+    h.invoke("action:reply-project", reply, invocation),
+    /The process died/,
+  );
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs[0].reply.status, "sending");
+  return { target, invocation, reply };
+}
+const replies = (h) => asked(h).filter((m) => m.threadId === "coordinator-1");
+
+NodeTest.test("a reply is saved as sending before the send", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  await h.invoke("action:reply-project", { handoffId, message: "Done." }, agent(target));
+  NodeAssert.deepEqual(h.state.statusesAtReply, ["sending"]);
+  const [stored] = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.equal(stored.reply.status, undefined);
+  NodeAssert.deepEqual(h.state.reads, []);
+  NodeAssert.match(replies(h)[0].text, new RegExp(`reply to handoff "${handoffId}"`));
+});
+
+NodeTest.test("a fault between a reply's send and save doesn't send it twice", async () => {
+  const h = await askingHost();
+  const { target, invocation, reply } = await lostReply(h);
+  // Unconfirmed, so nothing claims the answer has arrived.
+  NodeAssert.equal((await panel(h)).others[0].state, "sent");
+  NodeAssert.equal((await panel(h)).others[0].preview, "Please add a health check.");
+  const retry = await h.invoke("action:reply-project", reply, invocation);
+  NodeAssert.match(retry.message, /Reply sent/);
+  NodeAssert.deepEqual(h.state.reads, ["coordinator-1"]);
+  NodeAssert.equal(replies(h).length, 1);
+  NodeAssert.equal((await panel(h)).others[0].state, "replied");
+  // A new operationId with the same words is the same attempt, not a second reply.
+  await NodeAssert.rejects(
+    h.invoke("action:reply-project", reply, agent(target)),
+    /Each ask gets one reply/,
+  );
+});
+
+NodeTest.test("a new operationId retries a reply of unknown outcome, once", async () => {
+  const h = await askingHost();
+  const { target, reply } = await lostReply(h);
+  await h.invoke("action:reply-project", reply, agent(target));
+  NodeAssert.equal(replies(h).length, 1);
+});
+
+NodeTest.test("a reply that never left goes out on the retry", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  const invocation = agent(target, "unsent-reply");
+  const reply = { handoffId, message: "Done." };
+  h.state.sendError = new Error("The host is busy.");
+  await NodeAssert.rejects(h.invoke("action:reply-project", reply, invocation), /busy/);
+  h.state.sendError = null;
+  await h.invoke("action:reply-project", reply, invocation);
+  NodeAssert.equal(replies(h).length, 1);
+  NodeAssert.equal(h.state.reads.length, 1);
+});
+
+NodeTest.test("if the asker can't be read, a reply isn't sent again", async () => {
+  const h = await askingHost();
+  const { invocation, reply } = await lostReply(h);
+  h.state.readError = new Error("The host is busy.");
+  const blocked = await h.invoke("action:reply-project", reply, invocation);
+  NodeAssert.match(blocked.message, /wasn't sent again/);
+  NodeAssert.equal(replies(h).length, 1);
+  h.state.readError = null;
+  const retry = await h.invoke("action:reply-project", reply, invocation);
+  NodeAssert.match(retry.message, /Reply sent/);
+  NodeAssert.equal(replies(h).length, 1);
+});
+
+NodeTest.test("a different reply can't replace one of unknown outcome", async () => {
+  const h = await askingHost();
+  const { invocation, reply } = await lostReply(h);
+  await NodeAssert.rejects(
+    h.invoke("action:reply-project", { ...reply, message: "Something else." }, invocation),
+    /different reply/,
+  );
+  NodeAssert.equal(replies(h).length, 1);
+});
+
+NodeTest.test(
+  "a reply is refused without a stored handoff addressed to the caller",
+  async () => {
+    const h = await askingHost();
+    const { card } = await ask(h);
+    const { handoffId } = card.data;
+    // Unsent, so nobody has been asked yet.
+    await NodeAssert.rejects(
+      h.invoke(
+        "action:reply-project",
+        { handoffId, message: "Hi." },
+        agent("coordinator-1"),
+      ),
+      /no ask with that handoffId/,
+    );
+    await answer(h, "granted");
+    h.state.threads.set("stranger", thread("stranger", { projectId: "r" }));
+    for (const input of [
+      { handoffId, message: "Hi." },
+      { handoffId: "made-up", message: "Hi." },
+      { threadId: "coordinator-1", message: "Hi." },
+    ])
+      await NodeAssert.rejects(
+        h.invoke("action:reply-project", input, agent("stranger")),
+        /no ask with that handoffId/,
+      );
+    await NodeAssert.rejects(
+      h.invoke(
+        "action:reply-project",
+        { handoffId, message: "Hi." },
+        personIn({ threadId: "coordinator-1" }),
+      ),
+      /main conversation/,
+    );
+    NodeAssert.equal(asked(h).length, 1);
+  },
+);
+
+NodeTest.test(
+  "the Overview's other projects come from the target conversation and its workers",
+  async () => {
+    const h = await askingHost();
+    const before = await panel(h);
+    NodeAssert.deepEqual(before.others, []);
+    NodeAssert.equal(before.summary, "No workers yet");
+
+    const { handoffId, target } = await delivered(h);
+    h.state.threads.set(
+      "shelf-worker",
+      delegated("shelf-worker", "coordinator-1", { projectId: "p" }),
+    );
+    let data = await panel(h);
+    NodeAssert.equal(data.summary, "1 ready for review · waiting on Atlas");
+    NodeAssert.equal(data.others.length, 1);
+    NodeAssert.deepEqual(
+      (({ project, threadId, state, label, preview }) => ({
+        project,
+        threadId,
+        state,
+        label,
+        preview,
+      }))(data.others[0]),
+      {
+        project: "Atlas",
+        threadId: target,
+        state: "sent",
+        label: "Sent",
+        preview: "Please add a health check.",
+      },
+    );
+    // Started by the ask, the conversation is Atlas's own, not one of Shelf's threads.
+    NodeAssert.equal(h.state.threads.get(target).launchedFrom.threadId, "coordinator-1");
+    NodeAssert.equal(data.overview.groups.length, 1);
+    NodeAssert.deepEqual(
+      data.overview.groups[0].threads.map((t) => t.threadId),
+      ["shelf-worker"],
+    );
+
+    h.state.threads.get(target).isRunning = true;
+    data = await panel(h);
+    NodeAssert.equal(data.others[0].state, "working");
+    NodeAssert.equal((await row(h, handoffId)).label, "Working");
+
+    h.state.threads.get(target).isRunning = false;
+    h.state.threads.set("atlas-worker", delegated("atlas-worker", target, {
+      projectId: "q",
+      isRunning: true,
+    }));
+    NodeAssert.equal((await panel(h)).others[0].state, "working");
+    NodeAssert.equal((await row(h, handoffId)).title, "Asked Atlas");
+
+    h.state.threads.get("atlas-worker").needsAttention = true;
+    NodeAssert.equal((await panel(h)).others[0].state, "waiting");
+    h.state.threads.delete("atlas-worker");
+
+    await h.invoke(
+      "action:reply-project",
+      { handoffId, message: "Done on our side." },
+      agent(target),
+    );
+    data = await panel(h);
+    NodeAssert.equal(data.summary, "1 ready for review");
+    NodeAssert.equal(data.others[0].state, "replied");
+    NodeAssert.equal(data.others[0].preview, "Done on our side.");
+    NodeAssert.deepEqual(data.others[0].history, [
+      { who: "Asked", text: "Please add a health check." },
+      { who: "Atlas", text: "Done on our side." },
+    ]);
+  },
+);
+
+const shown = (row) => `${row.project} ${row.preview}`;
+
+NodeTest.test("an ask waiting for access shows without saying anything about the project", async () => {
+  const h = await askingHost();
+  await ask(h);
+  const data = await panel(h);
+  NodeAssert.equal(data.others.length, 1);
+  NodeAssert.equal(shown(data.others[0]), "Another project · Waiting for access");
+  NodeAssert.equal(data.others[0].discardable, true);
+  NodeAssert.equal(data.others[0].threadId, null);
+  NodeAssert.deepEqual(data.others[0].history, [
+    { who: "Waiting for access", text: "Please add a health check." },
+  ]);
+  NodeAssert.equal(data.summary, "No workers yet");
+  // Not the name, and not the id the agent gave either.
+  NodeAssert.doesNotMatch(JSON.stringify(data.others), /Atlas|"q"/);
+});
+
+NodeTest.test("a person can discard an ask waiting for access", async () => {
+  const h = await askingHost();
+  const invocation = agent("coordinator-1", "to-discard");
+  await ask(h, {}, invocation);
+  const requests = h.state.accessRequests.length;
+  const sends = h.state.sent.length;
+  const [{ key }] = (await panel(h)).others;
+  await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  NodeAssert.deepEqual((await panel(h)).others, []);
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 0);
+  NodeAssert.ok(h.state.invalidated.includes("view:asked"));
+  // Storage only: nothing is sent and the host hears nothing.
+  NodeAssert.equal(h.state.sent.length, sends);
+  NodeAssert.equal(h.state.accessRequests.length, requests);
+  // The agent can't bring it back by retrying.
+  const replay = await ask(h, {}, invocation);
+  NodeAssert.equal(replay.data.status, "used");
+  await answer(h, "granted");
+  NodeAssert.deepEqual(asked(h), []);
+});
+
+NodeTest.test("discarding the bad ids frees a blocked conversation at once", async () => {
+  const h = await askingHost();
+  h.state.deniedProjects.delete("q");
+  await fillWithBadIds(h);
+  NodeAssert.equal((await ask(h)).data.status, "limited");
+  const rows = (await panel(h)).others;
+  NodeAssert.equal(rows.length, 10);
+  NodeAssert.ok(rows.every((row) => shown(row) === "Another project · Waiting for access"));
+  for (const { key } of rows)
+    await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  NodeAssert.equal((await ask(h)).data.status, "sent");
+});
+
+NodeTest.test("a discarded sent ask refuses a reply, and an answered one stays", async () => {
+  const h = await askingHost();
+  const first = await delivered(h);
+  await h.invoke(
+    "action:reply-project",
+    { handoffId: first.handoffId, message: "Done." },
+    agent(first.target),
+  );
+  NodeAssert.equal((await panel(h)).others[0].discardable, false);
+  const second = await ask(h, { message: "One more." });
+  NodeAssert.equal((await panel(h)).others[0].discardable, true);
+  const [{ key }] = (await panel(h)).others;
+  await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  const stored = h.state.storage.get("handoffs.v1").handoffs;
+  NodeAssert.deepEqual(stored.map((entry) => entry.id), [first.handoffId]);
+  await NodeAssert.rejects(
+    h.invoke(
+      "action:reply-project",
+      { handoffId: second.data.handoffId, message: "Late." },
+      agent(first.target),
+    ),
+    /no ask with that handoffId/,
+  );
+  NodeAssert.equal((await panel(h)).others[0].state, "replied");
+});
+
+NodeTest.test("a person can discard a send of unknown outcome, however old", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: NOON });
+  const h = await askingHost();
+  await lostAfterSend(h);
+  h.state.readError = new Error("The host is busy.");
+  t.mock.timers.tick(30 * DAY);
+  const [{ key, discardable }] = (await panel(h)).others;
+  NodeAssert.equal(discardable, true);
+  await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 0);
+});
+
+NodeTest.test("only the asking project's panel can discard its asks", async () => {
+  const h = await askingHost();
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((c) => c.projectId === "r");
+  await ask(h);
+  const [{ key }] = (await panel(h)).others;
+  await h.invoke("view:overview:discard", { key }, client(harbor.id));
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 1);
+  // A worker this project started elsewhere opens its panel, but not its messages.
+  h.state.threads.set(
+    "harbor-worker",
+    thread("harbor-worker", {
+      projectId: "r",
+      launchedFrom: { threadId: "coordinator-1" },
+    }),
+  );
+  delete h.state.storage.get("coordinators.v1").projects.r;
+  await h.invoke("view:overview:discard", { key }, client("harbor-worker"));
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 1);
+  await h.invoke("view:overview:discard", { key: "made-up" }, client("coordinator-1"));
+  NodeAssert.equal(h.state.storage.get("handoffs.v1").handoffs.length, 1);
+});
+
+NodeTest.test("the subtitle stays short with several projects", async () => {
+  const h = await askingHost();
+  await delivered(h);
+  NodeAssert.equal((await panel(h)).summary, "Waiting on Atlas");
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  await ask(h, { projectId: "r", message: "Hello Harbor." });
+  NodeAssert.match(
+    (await panel(h)).summary,
+    /^Waiting on (Atlas and Harbor|Harbor and Atlas)$/,
+  );
+});
+
+NodeTest.test("revoking a project neutralises its rows, which can still be cleared", async () => {
+  const h = await askingHost();
+  const { handoffId } = await delivered(h);
+  h.state.deniedProjects.add("q");
+  const data = await panel(h);
+  NodeAssert.equal(data.others.length, 1);
+  NodeAssert.equal(shown(data.others[0]), "Another project · No access");
+  NodeAssert.deepEqual(data.others[0].history, []);
+  NodeAssert.equal(data.others[0].discardable, true);
+  NodeAssert.equal(data.summary, "No workers yet");
+  NodeAssert.deepEqual(await row(h, handoffId), {
+    title: "Asked another project",
+    threadId: null,
+    state: "sent",
+    label: "No access",
+  });
+  NodeAssert.doesNotMatch(JSON.stringify(data), /Atlas|health check/);
+});
+
+NodeTest.test("revoked asks that were answered drop out entirely", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  await h.invoke("action:reply-project", { handoffId, message: "Done." }, agent(target));
+  h.state.deniedProjects.add("q");
+  NodeAssert.deepEqual((await panel(h)).others, []);
+});
+
+NodeTest.test("a deleted target loses its link but keeps the history", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  h.state.threads.get(target).deleted = true;
+  NodeAssert.equal((await panel(h)).others[0].threadId, null);
+  NodeAssert.equal((await row(h, handoffId)).threadId, null);
+});
+
+NodeTest.test("messages between two projects never reach a third", async () => {
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  await h.invoke(
+    "action:reply-project",
+    { handoffId, message: "Secret plan." },
+    agent(target),
+  );
+  await h.invoke("action:new-project", {}, personIn({ projectId: "r" }));
+  const harbor = [...h.state.threads.values()].find((t) => t.projectId === "r");
+  const third = await panel(h, harbor.id);
+  NodeAssert.deepEqual(third.others, []);
+  NodeAssert.equal(third.overview.groups.length, 0);
+  NodeAssert.equal(await row(h, handoffId, harbor.id), null);
+  NodeAssert.equal(await row(h, handoffId, target), null);
+  // The receiver's own panel doesn't show the asker's history either.
+  NodeAssert.deepEqual((await panel(h, target)).others, []);
+  // A worker Shelf started in Harbor opens Shelf's panel, but not Shelf's messages.
+  h.state.threads.set(
+    "harbor-worker",
+    thread("harbor-worker", {
+      projectId: "r",
+      launchedFrom: { threadId: "coordinator-1" },
+    }),
+  );
+  h.state.storage.get("coordinators.v1").projects.r = undefined;
+  delete h.state.storage.get("coordinators.v1").projects.r;
+  const worker = await panel(h, "harbor-worker");
+  NodeAssert.equal(worker.projectId, "p");
+  NodeAssert.deepEqual(worker.others, []);
+  NodeAssert.doesNotMatch(JSON.stringify(worker), /Secret plan/);
+});
+
+NodeTest.test("the asker's row only reads in its own conversation, from stored state", async () => {
+  const h = await askingHost();
+  await delivered(h);
+  NodeAssert.equal(await row(h, "made-up"), null);
+  NodeAssert.equal(await row(h, undefined), null);
+});
+
+NodeTest.test("the Overview section is hidden when empty, and folds in place", async () => {
+  const html = NodeFs.readFileSync(new URL("../views/overview.html", import.meta.url), "utf8");
+  const element = () => ({
+    children: [], hidden: false, textContent: "", attributes: {}, listeners: {},
+    append(...nodes) { this.children.push(...nodes); },
+    replaceChildren(...nodes) { this.children = nodes; },
+    setAttribute(key, value) { this.attributes[key] = value; },
+    addEventListener(key, handler) { this.listeners[key] = handler; },
+  });
+  const text = (node) => [node.textContent, ...node.children.map(text)].join(" ");
+  const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(([, id]) => [id, element()]));
+  const h = await askingHost();
+  let refresh;
+  const intents = [];
+  NodeVm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+    document: {
+      getElementById: (id) => elements.get(id),
+      createElement: element, createElementNS: element, addEventListener() {},
+      createTextNode: (textContent) => ({ ...element(), textContent }),
+    },
+    window: { t3: {
+      invoke: (name, input) => h.invoke(`view:overview:${name}`, input, client("coordinator-1")),
+      onContext: (handler) => { refresh = handler; },
+      intent: async (intent) => { intents.push(intent); },
+    } },
+  });
+  await refresh();
+  NodeAssert.equal(elements.get("others").hidden, true);
+
+  const { handoffId, target } = await delivered(h);
+  await h.invoke("action:reply-project", { handoffId, message: "All done." }, agent(target));
+  await refresh();
+  NodeAssert.equal(elements.get("others").hidden, false);
+  NodeAssert.equal(elements.get("others-count").textContent, "1");
+  NodeAssert.equal(elements.get("summary").textContent, "No workers yet");
+  const rows = elements.get("other-rows");
+  NodeAssert.equal(rows.children.length, 1);
+  NodeAssert.equal(rows.children[0].attributes["aria-expanded"], "false");
+  NodeAssert.match(text(rows), /Atlas\s+All done\./);
+
+  rows.children[0].listeners.click();
+  NodeAssert.equal(rows.children.length, 2);
+  NodeAssert.equal(rows.children[0].attributes["aria-expanded"], "true");
+  const expanded = text(rows.children[1]);
+  NodeAssert.match(expanded, /Asked: \s*Please add a health check\./);
+  NodeAssert.match(expanded, /Atlas: \s*All done\./);
+  NodeAssert.match(expanded, /Open Atlas ›/);
+  NodeAssert.doesNotMatch(expanded, /Discard/);
+  const actions = rows.children[1].children.at(-1);
+  actions.children[0].listeners.click();
+  NodeAssert.equal(intents[0].threadId, target);
+
+  rows.children[0].listeners.click();
+  NodeAssert.equal(rows.children.length, 1);
+
+  // An open ask adds a quiet Discard, which takes the row with it.
+  await ask(h, { projectId: "r", message: "Hello Harbor." });
+  await refresh();
+  const harbor = rows.children[0];
+  NodeAssert.match(text(harbor), /Harbor/);
+  harbor.listeners.click();
+  const row = rows.children[1].children.at(-1);
+  NodeAssert.deepEqual(row.children.map((node) => node.textContent), ["Open Harbor ›", "Discard"]);
+  row.children[1].listeners.click();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  NodeAssert.doesNotMatch(text(rows), /Harbor/);
+});
+
+NodeTest.test("the asked card reads its handoff and links to the conversation", async () => {
+  const html = NodeFs.readFileSync(new URL("../views/asked.html", import.meta.url), "utf8");
+  const element = () => ({
+    textContent: "", hidden: true, disabled: true, className: "", listeners: {},
+    addEventListener(key, handler) { this.listeners[key] = handler; },
+  });
+  const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(([, id]) => [id, element()]));
+  const h = await askingHost();
+  const { handoffId, target } = await delivered(h);
+  const intents = [];
+  let invoked;
+  let changed;
+  NodeVm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+    document: { getElementById: (id) => elements.get(id), addEventListener() {} },
+    window: { t3: {
+      context: { card: { summary: "Asked Atlas", data: { handoffId } } },
+      invoke: (name, input) => (invoked = h.invoke(`view:asked:${name}`, input, client("coordinator-1"))),
+      onContext() {},
+      onChanged: (handler) => { changed = handler; },
+      intent: async (intent) => { intents.push(intent); },
+    } },
+  });
+  await invoked;
+  await new Promise(setImmediate);
+  NodeAssert.equal(elements.get("title").textContent, "Asked Atlas");
+  NodeAssert.equal(elements.get("status").textContent, "· Sent");
+  NodeAssert.equal(elements.get("row").disabled, false);
+  NodeAssert.equal(elements.get("chevron").hidden, false);
+  elements.get("row").listeners.click();
+  NodeAssert.equal(intents[0].type, "thread.reveal");
+  NodeAssert.equal(intents[0].threadId, target);
+  NodeAssert.doesNotMatch(html, /<form/);
+
+  // Once discarded the row keeps only its recorded summary, with no status or link.
+  const [{ key }] = (await panel(h)).others;
+  await h.invoke("view:overview:discard", { key }, client("coordinator-1"));
+  changed();
+  await invoked;
+  await new Promise(setImmediate);
+  NodeAssert.equal(elements.get("title").textContent, "Asked Atlas");
+  NodeAssert.equal(elements.get("status").textContent, "");
+  NodeAssert.equal(elements.get("row").disabled, true);
+  NodeAssert.equal(elements.get("chevron").hidden, true);
+});
+
+NodeTest.test("the manifest declares the handoff the host needs", () => {
+  const manifest = JSON.parse(
+    NodeFs.readFileSync(new URL("../t3-plugin.json", import.meta.url), "utf8"),
+  );
+  for (const capability of ["threads.send", "projects.request-access", "ui.conversation-cards"])
+    NodeAssert.ok(manifest.capabilities.includes(capability), capability);
+  NodeAssert.notEqual(manifest.version, "0.1.0");
+  const action = (id) => manifest.actions.find((a) => a.id === id);
+  NodeAssert.equal(action("ask-project").agentCallable, true);
+  NodeAssert.equal(action("reply-project").agentCallable, true);
+  // An agent calling it could pass off its own input as a person's answer.
+  NodeAssert.ok(action("project-access"));
+  NodeAssert.notEqual(action("project-access").agentCallable, true);
+  NodeAssert.deepEqual(action("project-access").placements, []);
+  const h = host();
+  for (const { id } of manifest.actions)
+    NodeAssert.ok(h.handlers.has(`action:${id}`), id);
+  NodeAssert.equal(
+    manifest.views.find((view) => view.id === "asked").placement,
+    "conversation",
+  );
 });

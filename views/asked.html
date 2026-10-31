@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Asked project</title>
+    <style>
+      /* T3 applies its theme variables to <html>; the fallbacks cover the first paint. The host
+         sizes the frame to this document and draws its border, so the row is all there is. */
+      :root {
+        --bg: var(--color-background-primary, #ffffff);
+        --muted-bg: var(--color-background-tertiary, #f1f1f3);
+        --fg: var(--color-text-primary, #111113);
+        --muted: var(--color-text-secondary, #6b6b74);
+        --ring: var(--color-ring-primary, #6b6bff);
+        --info: var(--color-text-info, #2563eb);
+        --success: var(--color-text-success, #15803d);
+        --warning: var(--color-text-warning, #b45309);
+        --font: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+        color-scheme: light dark;
+      }
+      html[data-t3-theme="dark"] {
+        --bg: var(--color-background-primary, #0b0b0c);
+        --muted-bg: var(--color-background-tertiary, #1c1c1f);
+        --fg: var(--color-text-primary, #ededef);
+        --muted: var(--color-text-secondary, #a1a1aa);
+        --info: var(--color-text-info, #60a5fa);
+        --success: var(--color-text-success, #4ade80);
+        --warning: var(--color-text-warning, #fbbf24);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      html,
+      body {
+        margin: 0;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px/1.45 var(--font);
+      }
+      button {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        width: 100%;
+        height: 32px;
+        padding: 0 10px;
+        border: 0;
+        background: none;
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      button:disabled {
+        cursor: default;
+      }
+      button:hover:not(:disabled) {
+        background: var(--muted-bg);
+      }
+      button:focus-visible {
+        outline: 2px solid var(--ring);
+        outline-offset: -2px;
+      }
+      #title {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #status {
+        flex: none;
+        color: var(--muted);
+      }
+      #status.working {
+        color: var(--info);
+      }
+      #status.waiting,
+      #status.undelivered {
+        color: var(--warning);
+      }
+      #status.replied {
+        color: var(--success);
+      }
+      #chevron {
+        flex: none;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <button type="button" id="row" disabled>
+      <span id="title"></span>
+      <span id="status"></span>
+      <span id="chevron" aria-hidden="true" hidden>›</span>
+    </button>
+    <script>
+      (function () {
+        "use strict";
+        var t3 = window.t3;
+        var $ = function (id) {
+          return document.getElementById(id);
+        };
+        var data = null;
+
+        // A discarded or long-gone ask has nothing left to say beyond its recorded summary.
+        function render(card) {
+          $("title").textContent = data ? data.title : card.summary;
+          $("status").textContent = data ? "· " + data.label : "";
+          $("status").className = data ? data.state : "";
+          $("row").disabled = !data || !data.threadId;
+          $("chevron").hidden = !data || !data.threadId;
+        }
+
+        function refresh() {
+          var card = t3.context && t3.context.card;
+          if (!card) return;
+          if (!data) $("title").textContent = card.summary;
+          var id = card.data && card.data.handoffId;
+          t3.invoke("read", { handoffId: id }).then(
+            function (result) {
+              data = result.data;
+              render(card);
+            },
+            // The recorded summary stays readable, and the next signal tries again.
+            function () {},
+          );
+        }
+
+        $("row").addEventListener("click", function () {
+          if (data && data.threadId && t3.intent)
+            t3.intent({ type: "thread.reveal", threadId: data.threadId });
+        });
+
+        if (!t3) return;
+        t3.onContext(refresh);
+        if (t3.context) refresh();
+        if (t3.onChanged) t3.onChanged(refresh);
+        // Older hosts send no change signal for views; catch up when the card comes back into view.
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState === "visible") refresh();
+        });
+      })();
+    </script>
+  </body>
+</html>

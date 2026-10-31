@@ -15,6 +15,11 @@ run in parallel, nested under the project, then reviews and merges their work.
   its own worktree, reviews what comes back, and asks before merging.
 - **An Overview** beside the conversation. It groups threads into Ready for review, Waiting on you,
   Working and Done, and holds a short **project memory** that every thread gets.
+- **Work across projects.** When work belongs to another project, the coordinator asks that
+  project's coordinator instead of starting a worker there. The first time, T3 shows you a card;
+  after **Add**, the project joins the sidebar with its own conversation, and its workers nest under
+  it. Messages are labelled with the project they came from, and the reply comes back to the
+  conversation that asked. The Overview lists those projects under **Other projects**.
 - **Activity stays your inbox.** Project conversations and their threads show only in the Projects
   tab.
 
@@ -25,7 +30,8 @@ run in parallel, nested under the project, then reviews and merges their work.
 ## Install
 
 This needs a T3 Code build with the plugin system. It isn't in official T3 Code yet, so for now use
-the [`plugin-system` branch](https://github.com/Zeus-Deus/t3code/tree/plugin-system).
+the [`plugin-system` branch](https://github.com/Zeus-Deus/t3code/tree/plugin-system). Version 0.2
+needs a build that can ask for a project from a conversation; older builds refuse it.
 
 1. Clone this repo.
 2. In T3 Code, open **Settings → Plugins** and install the folder by its path, or install it from
@@ -39,7 +45,18 @@ the [`plugin-system` branch](https://github.com/Zeus-Deus/t3code/tree/plugin-sys
   brings the same conversation back.
 - **Disabling the plugin** puts those conversations back in Activity, so nothing is lost.
 - **Agents** can read the playbook and the project memory through `t3_plugin_invoke`, using the
-  `guide`, `memory-read` and `memory-append` actions.
+  `guide`, `memory-read` and `memory-append` actions. Project coordinators reach each other with
+  `ask-project` and `reply-project`.
+- **Asks are limited** to 10 an hour in each direction between two projects, so two coordinators
+  can't keep each other going. Past that, nothing is sent and the coordinator tells you.
+- **Not now** on a project card sends nothing, and T3 won't ask about that project again until you
+  next write in that conversation.
+- **Removing the plugin's access** to a project takes it out of the Overview; rows already in a
+  conversation stop naming it. The plugin keeps a short preview of up to 100 asks between projects,
+  answered ones going first, and each conversation shows only its own.
+- **Nothing stays stuck.** Expand a project under **Other projects** and choose **Discard** to drop
+  its open asks. An ask still waiting to go out expires after a day, and an unanswered one stops
+  holding a place after a week, so newer asks can replace it.
 
 ## Development
 
