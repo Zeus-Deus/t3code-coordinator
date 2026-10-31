@@ -9,7 +9,8 @@ run in parallel, nested under the project, then reviews and merges their work.
 ## What you get
 
 - **A Projects tab.** It lists the projects you've started, most recent first. Click one to open its
-  conversation. Its threads nest underneath it with their live status.
+  conversation. Its threads nest underneath it with their live status; settled ones move to the
+  Settled section at the bottom of the sidebar.
 - **One conversation per project.** The coordinator plans the work, hands each piece to a thread in
   its own worktree, reviews what comes back, and asks before merging.
 - **An Overview** beside the conversation. It groups threads into Ready for review, Waiting on you,

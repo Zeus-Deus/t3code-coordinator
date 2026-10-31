@@ -410,6 +410,74 @@ NodeTest.test(
   },
 );
 
+NodeTest.test(
+  "as its own view, the tree leaves settled workers to T3 and keeps the ones still in play",
+  () => {
+    const settled = { settledAt: "2026-10-25T10:00:00Z" };
+    const workers = [
+      // More than fit inline, so some sit in the section's Done group and some in its workers.
+      ...Array.from({ length: TREE_LIMITS.inlineDone + 2 }, (_, i) =>
+        delegated(`settled${i}`, "c", {
+          createdAt: `2026-10-25T0${i}:00:00Z`,
+          ...settled,
+        }),
+      ),
+      thread("launched", { launchedFrom: { threadId: "c" }, ...settled }),
+      delegated("waiting", "c", { needsAttention: true, ...settled }),
+      delegated("working", "c", { isRunning: true, ...settled }),
+      delegated("ready"),
+    ];
+    const section = projectSection("p", [thread("c"), ...workers], "c");
+    NodeAssert.ok(section.done.length > 0);
+    const { nodes } = buildTree([section], {
+      openAction: "open",
+      coordinatorsOnly: true,
+    });
+    NodeAssert.ok(!nodes.some((node) => node.kind === "group"));
+    NodeAssert.deepEqual(
+      nodes.flatMap((n) => (n.kind === "thread" ? [n.threadId] : [])).sort(),
+      ["ready", "waiting", "working"],
+    );
+    NodeAssert.ok(
+      nodes
+        .filter((n) => n.kind === "thread")
+        .every((n) => n.parentId === nodes[0].id),
+    );
+  },
+);
+
+NodeTest.test("a tree beside Activity keeps settled workers and its Done group", () => {
+  const workers = Array.from({ length: TREE_LIMITS.inlineDone + 1 }, (_, i) =>
+    delegated(`w${i}`, "c", {
+      createdAt: `2026-10-25T0${i}:00:00Z`,
+      settledAt: "2026-10-25T10:00:00Z",
+    }),
+  );
+  const { nodes } = buildTree([projectSection("p", [thread("c"), ...workers], "c")], {
+    openAction: "open",
+  });
+  const done = nodes.find((node) => node.kind === "group");
+  NodeAssert.equal(nodes.find((n) => n.threadId === "w0").parentId, done.id);
+  NodeAssert.equal(nodes.find((n) => n.threadId === "w1").parentId, nodes[0].id);
+  NodeAssert.equal(nodes.filter((n) => n.kind === "thread").length, workers.length);
+});
+
+NodeTest.test("a project whose workers are all settled keeps its heading", () => {
+  const section = projectSection(
+    "p",
+    [thread("c"), delegated("w", "c", { settledAt: "2026-10-25T10:00:00Z" })],
+    "c",
+  );
+  const { nodes } = buildTree([section], {
+    openAction: "open",
+    coordinatorsOnly: true,
+  });
+  NodeAssert.deepEqual(
+    nodes.map((n) => [n.kind, n.threadId]),
+    [["project", "c"]],
+  );
+});
+
 NodeTest.test("workers left out of a section don't count towards its Done fold", () => {
   const settled = (id, projectId, createdAt) =>
     thread(id, {
